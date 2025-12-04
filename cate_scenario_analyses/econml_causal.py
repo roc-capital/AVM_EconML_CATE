@@ -1,11 +1,11 @@
 """
-ECONML CAUSAL ANALYSIS: RENOVATION ROI BY GEOGRAPHIC AREA
+ECONML CAUSAL ANALYSIS: RENOVATION EFFECTS BY GEOGRAPHIC AREA
 Estimates heterogeneous treatment effects (HTE) for property renovations
 
 Business Questions Answered:
 1. What's the causal effect of adding a half bathroom in Cluster 44 vs Cluster 21?
-2. What's the ROI of adding a bedroom in different neighborhoods?
-3. Which renovation (bath, bedroom, garage) has highest ROI in MY area?
+2. What's the value increase from adding a bedroom in different neighborhoods?
+3. Which renovation (bath, bedroom, garage) has highest impact in MY area?
 
 Uses Double ML (DML) with causal forests to discover heterogeneous effects
 """
@@ -47,7 +47,7 @@ TREATMENTS = {
     'HALF_BATHS_COAL': {
         'name': 'Half Bathroom',
         'unit': 'bathroom',
-        'typical_cost': 5000,  # Typical renovation cost
+        'typical_cost': 5000,  # Typical renovation cost (for reference only)
     },
     'BEDROOMS_MLS': {
         'name': 'Bedroom',
@@ -87,6 +87,7 @@ EFFECT_MODIFIERS = [
 # Geographic clustering
 N_GEO_CLUSTERS = 45
 TOP_CLUSTERS_TO_ANALYZE = 10  # Analyze top N clusters by frequency
+PRICE_WEIGHT = 0.3  # Weight for price in clustering (0=pure location, 1=pure price, 0.3=recommended)
 
 # EconML settings
 ECONML_METHOD = 'causal_forest'  # 'causal_forest', 'linear_dml', or 'dr_learner'
@@ -321,10 +322,6 @@ def analyze_effects_by_cluster(effects_dict, data, treatment_info):
         n_properties = len(cluster_data)
         avg_price = cluster_data[Y_COL].mean()
 
-        # Calculate ROI
-        renovation_cost = treatment_info['typical_cost']
-        roi = ((avg_effect - renovation_cost) / renovation_cost) * 100
-
         cluster_effects.append({
             'cluster': int(cluster_id),
             'n_properties': n_properties,
@@ -334,39 +331,32 @@ def analyze_effects_by_cluster(effects_dict, data, treatment_info):
             'std_effect': std_effect,
             'ci_lower': ci_lower,
             'ci_upper': ci_upper,
-            'renovation_cost': renovation_cost,
-            'roi_pct': roi
         })
 
     cluster_df = pd.DataFrame(cluster_effects).sort_values('avg_effect', ascending=False)
 
     print(f"\nTop {TOP_CLUSTERS_TO_ANALYZE} Clusters by Sample Size:")
-    print(f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Effect':>12} {'95% CI':>25} {'ROI':>8}")
-    print("-" * 95)
+    print(f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Effect':>12} {'95% CI':>25}")
+    print("-" * 77)
 
     for _, row in cluster_df.iterrows():
         ci_str = f"[${row['ci_lower']:>6,.0f}, ${row['ci_upper']:>6,.0f}]"
-        roi_str = f"{row['roi_pct']:>6.1f}%" if row['roi_pct'] > -100 else " <-100%"
         print(f"Cluster {row['cluster']:<3} {row['n_properties']:>8,} "
               f"${row['avg_price']:>11,.0f} ${row['avg_effect']:>11,.0f} "
-              f"{ci_str:>25} {roi_str:>8}")
+              f"{ci_str:>25}")
 
     # Interpretation
     print(f"\n💡 Interpretation:")
     best_cluster = cluster_df.iloc[0]
     worst_cluster = cluster_df.iloc[-1]
 
-    print(f"\n🏆 Best ROI:")
+    print(f"\n🏆 Highest Effect:")
     print(
         f"  Cluster {int(best_cluster['cluster'])}: Adding one {treatment_info['unit']} increases value by ${best_cluster['avg_effect']:,.0f}")
-    print(f"  Typical renovation cost: ${best_cluster['renovation_cost']:,.0f}")
-    print(f"  ROI: {best_cluster['roi_pct']:.1f}%")
 
-    print(f"\n📉 Worst ROI:")
+    print(f"\n📉 Lowest Effect:")
     print(
         f"  Cluster {int(worst_cluster['cluster'])}: Adding one {treatment_info['unit']} increases value by ${worst_cluster['avg_effect']:,.0f}")
-    print(f"  Typical renovation cost: ${worst_cluster['renovation_cost']:,.0f}")
-    print(f"  ROI: {worst_cluster['roi_pct']:.1f}%")
 
     effect_range = best_cluster['avg_effect'] - worst_cluster['avg_effect']
     print(f"\n📊 Effect Heterogeneity:")
@@ -379,10 +369,10 @@ def analyze_effects_by_cluster(effects_dict, data, treatment_info):
 
 def compare_renovation_options(all_results):
     """
-    Compare ROI across different renovation types
+    Compare treatment effects across different renovation types
     """
     print(f"\n{'=' * 80}")
-    print("RENOVATION COMPARISON: WHICH HAS BEST ROI?")
+    print("RENOVATION COMPARISON: WHICH HAS HIGHEST VALUE IMPACT?")
     print(f"{'=' * 80}")
 
     comparison = []
@@ -394,32 +384,30 @@ def compare_renovation_options(all_results):
         avg_effect = cluster_df['avg_effect'].mean()
         best_effect = cluster_df['avg_effect'].max()
         worst_effect = cluster_df['avg_effect'].min()
-        avg_roi = cluster_df['roi_pct'].mean()
 
         comparison.append({
             'renovation': treatment_info['name'],
-            'cost': treatment_info['typical_cost'],
             'avg_effect': avg_effect,
-            'avg_roi': avg_roi,
             'best_cluster_effect': best_effect,
             'worst_cluster_effect': worst_effect,
             'effect_range': best_effect - worst_effect
         })
 
-    comp_df = pd.DataFrame(comparison).sort_values('avg_roi', ascending=False)
+    comp_df = pd.DataFrame(comparison).sort_values('avg_effect', ascending=False)
 
-    print(f"\n{'Renovation':<20} {'Cost':>10} {'Avg Effect':>12} {'Avg ROI':>10} {'Effect Range':>15}")
+    print(f"\n{'Renovation':<20} {'Avg Effect':>12} {'Best Cluster':>15} {'Worst Cluster':>15} {'Range':>12}")
     print("-" * 80)
 
     for _, row in comp_df.iterrows():
-        print(f"{row['renovation']:<20} ${row['cost']:>9,} ${row['avg_effect']:>11,.0f} "
-              f"{row['avg_roi']:>9.1f}% ${row['effect_range']:>14,.0f}")
+        print(f"{row['renovation']:<20} ${row['avg_effect']:>11,.0f} "
+              f"${row['best_cluster_effect']:>14,.0f} "
+              f"${row['worst_cluster_effect']:>14,.0f} "
+              f"${row['effect_range']:>11,.0f}")
 
-    print(f"\n🎯 Recommendation:")
-    best_roi = comp_df.iloc[0]
-    print(f"  Best overall ROI: {best_roi['renovation']}")
-    print(
-        f"  Average return: ${best_roi['avg_effect']:,.0f} on ${best_roi['cost']:,.0f} investment ({best_roi['avg_roi']:.1f}% ROI)")
+    print(f"\n🎯 Key Finding:")
+    best_effect = comp_df.iloc[0]
+    print(f"  Highest average effect: {best_effect['renovation']}")
+    print(f"  Average value increase: ${best_effect['avg_effect']:,.0f}")
 
     print(f"\n📊 Geographic Sensitivity:")
     most_heterogeneous = comp_df.sort_values('effect_range', ascending=False).iloc[0]
@@ -441,34 +429,34 @@ def visualize_heterogeneous_effects(results, treatment_info):
     # 1. Treatment effects by cluster
     ax1 = axes[0, 0]
     cluster_df_sorted = cluster_df.sort_values('avg_effect')
-    colors = ['#2ecc71' if roi > 0 else '#e74c3c' for roi in cluster_df_sorted['roi_pct']]
+    colors = ['#3498db'] * len(cluster_df_sorted)
 
     bars = ax1.barh(range(len(cluster_df_sorted)), cluster_df_sorted['avg_effect'] / 1000, color=colors, alpha=0.7)
     ax1.set_yticks(range(len(cluster_df_sorted)))
     ax1.set_yticklabels([f"C{int(c)}" for c in cluster_df_sorted['cluster']], fontsize=9)
     ax1.set_xlabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
     ax1.set_title(f'Effect of Adding {treatment_info["name"]} by Cluster', fontsize=12, fontweight='bold')
-    ax1.axvline(x=treatment_info['typical_cost'] / 1000, color='red', linestyle='--', linewidth=2,
-                label='Renovation Cost')
-    ax1.legend()
     ax1.grid(axis='x', alpha=0.3)
 
-    # 2. ROI by cluster
+    # 2. Effect with confidence intervals
     ax2 = axes[0, 1]
-    cluster_df_sorted_roi = cluster_df.sort_values('roi_pct')
-    colors_roi = ['#2ecc71' if roi > 0 else '#e74c3c' for roi in cluster_df_sorted_roi['roi_pct']]
+    cluster_df_sorted_ci = cluster_df.sort_values('avg_effect')
+    y_pos = range(len(cluster_df_sorted_ci))
 
-    ax2.barh(range(len(cluster_df_sorted_roi)), cluster_df_sorted_roi['roi_pct'], color=colors_roi, alpha=0.7)
-    ax2.set_yticks(range(len(cluster_df_sorted_roi)))
-    ax2.set_yticklabels([f"C{int(c)}" for c in cluster_df_sorted_roi['cluster']], fontsize=9)
-    ax2.set_xlabel('ROI (%)', fontsize=11, fontweight='bold')
-    ax2.set_title(f'ROI by Cluster', fontsize=12, fontweight='bold')
-    ax2.axvline(x=0, color='black', linestyle='--', linewidth=2)
+    ax2.barh(y_pos, cluster_df_sorted_ci['avg_effect'] / 1000, color='#3498db', alpha=0.7)
+    ax2.errorbar(cluster_df_sorted_ci['avg_effect'] / 1000, y_pos,
+                 xerr=[(cluster_df_sorted_ci['avg_effect'] - cluster_df_sorted_ci['ci_lower']) / 1000,
+                       (cluster_df_sorted_ci['ci_upper'] - cluster_df_sorted_ci['avg_effect']) / 1000],
+                 fmt='none', ecolor='black', elinewidth=1, capsize=3)
+    ax2.set_yticks(y_pos)
+    ax2.set_yticklabels([f"C{int(c)}" for c in cluster_df_sorted_ci['cluster']], fontsize=9)
+    ax2.set_xlabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
+    ax2.set_title(f'Effect with 95% Confidence Intervals', fontsize=12, fontweight='bold')
     ax2.grid(axis='x', alpha=0.3)
 
     # 3. Effect vs Price Level
     ax3 = axes[1, 0]
-    ax3.scatter(cluster_df['avg_price'] / 1000, cluster_df['avg_effect'] / 1000, s=100, alpha=0.6)
+    ax3.scatter(cluster_df['avg_price'] / 1000, cluster_df['avg_effect'] / 1000, s=100, alpha=0.6, color='#3498db')
     ax3.set_xlabel('Average Property Price ($1000s)', fontsize=11, fontweight='bold')
     ax3.set_ylabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
     ax3.set_title('Effect vs Property Price Level', fontsize=12, fontweight='bold')
@@ -485,8 +473,6 @@ def visualize_heterogeneous_effects(results, treatment_info):
     ax4.hist(effects_data / 1000, bins=50, alpha=0.7, color='#3498db', edgecolor='black')
     ax4.axvline(x=effects_data.mean() / 1000, color='red', linestyle='--', linewidth=2,
                 label=f'Mean: ${effects_data.mean() / 1000:.1f}K')
-    ax4.axvline(x=treatment_info['typical_cost'] / 1000, color='orange', linestyle='--', linewidth=2,
-                label=f'Cost: ${treatment_info["typical_cost"] / 1000:.1f}K')
     ax4.set_xlabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
     ax4.set_ylabel('Frequency', fontsize=11, fontweight='bold')
     ax4.set_title(f'Distribution of Treatment Effects', fontsize=12, fontweight='bold')
@@ -510,7 +496,7 @@ def main():
     Main execution: Analyze causal effects for multiple renovation types
     """
     print("\n" + "=" * 80)
-    print(" " * 10 + "ECONML CAUSAL ANALYSIS: RENOVATION ROI BY AREA")
+    print(" " * 10 + "ECONML CAUSAL ANALYSIS: RENOVATION EFFECTS BY AREA")
     print("=" * 80)
 
     # Load and prepare data
@@ -520,7 +506,7 @@ def main():
     if IS_PANEL_DATA:
         df = collapse_to_property_level(df, DECAY_FACTOR)
 
-    df = create_geo_clusters(df)
+    df = create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=PRICE_WEIGHT)
 
     # Analyze each treatment
     all_results = {}
@@ -586,11 +572,12 @@ def main():
 
     return all_results
 
+
 def create_summary_report(all_results):
     """Create executive summary report"""
     with open('causal_analysis_summary.txt', 'w') as f:
         f.write("=" * 80 + "\n")
-        f.write("CAUSAL ANALYSIS SUMMARY: RENOVATION ROI BY GEOGRAPHIC AREA\n")
+        f.write("CAUSAL ANALYSIS SUMMARY: RENOVATION EFFECTS BY GEOGRAPHIC AREA\n")
         f.write("=" * 80 + "\n\n")
 
         for treatment_col, results in all_results.items():
@@ -603,14 +590,11 @@ def create_summary_report(all_results):
             best = cluster_df.iloc[0]
             worst = cluster_df.iloc[-1]
 
-            f.write(f"\nBest ROI:\n")
+            f.write(f"\nHighest Effect:\n")
             f.write(f"  Cluster {int(best['cluster'])}: ${best['avg_effect']:,.0f} value increase\n")
-            f.write(f"  Cost: ${best['renovation_cost']:,.0f}\n")
-            f.write(f"  ROI: {best['roi_pct']:.1f}%\n")
 
-            f.write(f"\nWorst ROI:\n")
+            f.write(f"\nLowest Effect:\n")
             f.write(f"  Cluster {int(worst['cluster'])}: ${worst['avg_effect']:,.0f} value increase\n")
-            f.write(f"  ROI: {worst['roi_pct']:.1f}%\n")
 
             f.write(f"\nHeterogeneity:\n")
             f.write(f"  Effect range: ${best['avg_effect'] - worst['avg_effect']:,.0f}\n")
@@ -619,6 +603,85 @@ def create_summary_report(all_results):
             f.write("\n")
 
     print("✓ Saved: causal_analysis_summary.txt")
+
+
+def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=0.3):
+    """
+    Create geographic clusters using both location and price
+
+    Parameters:
+    -----------
+    df : DataFrame
+        Data with LATITUDE, LONGITUDE, and price columns
+    n_clusters : int
+        Number of clusters to create
+    price_weight : float (0 to 1)
+        Weight for price vs location.
+        0 = pure geographic clustering
+        1 = pure price clustering
+        0.3 = 30% price, 70% location (recommended)
+    """
+    print(f"\n{'=' * 80}")
+    print(f"CREATING {n_clusters} GEO-PRICE CLUSTERS")
+    print(f"{'=' * 80}")
+    print(f"  Price weight: {price_weight:.1%}")
+    print(f"  Location weight: {(1 - price_weight):.1%}")
+
+    # Prepare features
+    required_cols = ['LATITUDE', 'LONGITUDE', Y_COL]
+    X_data = df[required_cols].dropna()
+
+    # Separate geographic and price features
+    X_geo = X_data[['LATITUDE', 'LONGITUDE']].values
+    X_price = X_data[[Y_COL]].values
+
+    # Standardize separately to control weighting
+    scaler_geo = StandardScaler()
+    scaler_price = StandardScaler()
+
+    X_geo_scaled = scaler_geo.fit_transform(X_geo)
+    X_price_scaled = scaler_price.fit_transform(X_price)
+
+    # Combine with weighting
+    # Location gets (1-price_weight), price gets price_weight
+    X_geo_weighted = X_geo_scaled * (1 - price_weight)
+    X_price_weighted = X_price_scaled * price_weight
+
+    # Concatenate
+    X_combined = np.hstack([X_geo_weighted, X_price_weighted])
+
+    # Fit K-means
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    df.loc[X_data.index, 'GEO_CLUSTER'] = kmeans.fit_predict(X_combined)
+    df['GEO_CLUSTER'] = df['GEO_CLUSTER'].fillna(df['GEO_CLUSTER'].mode()[0]).astype(int)
+
+    # Analyze clusters
+    cluster_stats = df.groupby('GEO_CLUSTER').agg({
+        Y_COL: ['mean', 'std', 'min', 'max', 'count'],
+        'LATITUDE': ['mean', 'std'],
+        'LONGITUDE': ['mean', 'std']
+    }).round(2)
+
+    print(f"\n✓ Created {n_clusters} clusters")
+    print(f"\nCluster Statistics:")
+    print(f"  Price range: ${cluster_stats[(Y_COL, 'mean')].min():,.0f} - ${cluster_stats[(Y_COL, 'mean')].max():,.0f}")
+    print(f"  Avg within-cluster price std: ${cluster_stats[(Y_COL, 'std')].mean():,.0f}")
+    print(f"  Avg properties per cluster: {cluster_stats[(Y_COL, 'count')].mean():.0f}")
+
+    # Show example clusters
+    print(f"\nExample Clusters (Top 5 by size):")
+    print(f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Price Std':>12} {'Lat':>8} {'Lon':>8}")
+    print("-" * 75)
+
+    top_clusters = cluster_stats.nlargest(5, (Y_COL, 'count'))
+    for idx in top_clusters.index:
+        row = cluster_stats.loc[idx]
+        print(f"Cluster {idx:<3} {int(row[(Y_COL, 'count')]):>8,} "
+              f"${row[(Y_COL, 'mean')]:>11,.0f} ${row[(Y_COL, 'std')]:>11,.0f} "
+              f"{row[('LATITUDE', 'mean')]:>7.3f} {row[('LONGITUDE', 'mean')]:>7.3f}")
+
+    return df
+
 
 if __name__ == "__main__":
     if not ECONML_AVAILABLE:
