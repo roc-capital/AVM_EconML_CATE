@@ -1,0 +1,629 @@
+"""
+ECONML CAUSAL ANALYSIS: RENOVATION ROI BY GEOGRAPHIC AREA
+Estimates heterogeneous treatment effects (HTE) for property renovations
+
+Business Questions Answered:
+1. What's the causal effect of adding a half bathroom in Cluster 44 vs Cluster 21?
+2. What's the ROI of adding a bedroom in different neighborhoods?
+3. Which renovation (bath, bedroom, garage) has highest ROI in MY area?
+
+Uses Double ML (DML) with causal forests to discover heterogeneous effects
+"""
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+import warnings
+
+warnings.filterwarnings('ignore')
+
+# EconML imports
+try:
+    from econml.dml import CausalForestDML, LinearDML
+    from econml.dr import DRLearner
+
+    ECONML_AVAILABLE = True
+except ImportError:
+    print("⚠️ EconML not installed. Install with: pip install econml")
+    ECONML_AVAILABLE = False
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df.parquet"
+
+IS_PANEL_DATA = True
+PROPERTYID_COL = "PROPERTYID"
+DECAY_FACTOR = 0.9
+Y_COL = "SALEAMT"
+
+# TREATMENTS: What renovations are we analyzing?
+TREATMENTS = {
+    'HALF_BATHS_COAL': {
+        'name': 'Half Bathroom',
+        'unit': 'bathroom',
+        'typical_cost': 5000,  # Typical renovation cost
+    },
+    'BEDROOMS_MLS': {
+        'name': 'Bedroom',
+        'unit': 'bedroom',
+        'typical_cost': 15000,
+    },
+    'GARAGE_SPACES_COAL': {
+        'name': 'Garage Space',
+        'unit': 'space',
+        'typical_cost': 12000,
+    },
+    'FULL_BATHS_COAL': {
+        'name': 'Full Bathroom',
+        'unit': 'bathroom',
+        'typical_cost': 10000,
+    }
+}
+
+# CONFOUNDERS: What affects both treatment and outcome?
+CONFOUNDERS = [
+    'LIVINGAREASQFT_COAL',  # Size affects both # of rooms and price
+    'LOTSIZESQFT_COAL',
+    'YEARBUILT_COAL',
+    'EFFECTIVEYEARBUILT_COAL',
+    'FIREPLACE_COUNT_MLS',
+    'YEAR',
+]
+
+# EFFECT MODIFIERS: What makes treatment effects vary?
+EFFECT_MODIFIERS = [
+    'GEO_CLUSTER',  # Key: effects vary by location!
+    'LIVINGAREASQFT_COAL',  # Effects vary by house size
+    'YEARBUILT_COAL',  # Effects vary by house age
+    'PRICE_LEVEL',  # Effects vary by price tier
+]
+
+# Geographic clustering
+N_GEO_CLUSTERS = 45
+TOP_CLUSTERS_TO_ANALYZE = 10  # Analyze top N clusters by frequency
+
+# EconML settings
+ECONML_METHOD = 'causal_forest'  # 'causal_forest', 'linear_dml', or 'dr_learner'
+N_BOOTSTRAP = 100
+CONFIDENCE_LEVEL = 0.95
+
+
+# ============================================================================
+# DATA PREPARATION
+# ============================================================================
+
+def collapse_to_property_level(df, decay=0.9):
+    """Collapse panel data - same as before"""
+    if PROPERTYID_COL not in df.columns:
+        return df
+
+    print(f"\n{'=' * 80}")
+    print("COLLAPSING PANEL DATA")
+    print(f"{'=' * 80}")
+
+    last_cols = [c for c in [
+        "YEAR", "BEDROOMS_MLS", "FULL_BATHS_COAL", "HALF_BATHS_COAL",
+        "LIVINGAREASQFT_COAL", "LOTSIZESQFT_COAL",
+        "YEARBUILT_COAL", "EFFECTIVEYEARBUILT_COAL",
+        "GARAGE_SPACES_COAL", "FIREPLACE_COUNT_MLS",
+        "LATITUDE", "LONGITUDE"
+    ] if c in df.columns]
+
+    df_sorted = df.sort_values([PROPERTYID_COL, "YEAR"])
+    df_last = df_sorted.groupby(PROPERTYID_COL, as_index=False)[last_cols].last()
+
+    def discounted_saleamt(group):
+        max_year = group["YEAR"].max()
+        weights = decay ** (max_year - group["YEAR"])
+        return np.average(group["SALEAMT"], weights=weights)
+
+    df_saleamt = (df_sorted.groupby(PROPERTYID_COL)
+                  .apply(discounted_saleamt)
+                  .rename("SALEAMT").reset_index())
+
+    df_property = df_last.merge(df_saleamt, on=PROPERTYID_COL, how="left")
+    print(f"✓ Collapsed to {len(df_property):,} properties")
+    return df_property
+
+
+def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS):
+    """Create geographic clusters"""
+    print(f"\n{'=' * 80}")
+    print(f"CREATING {n_clusters} GEOGRAPHIC CLUSTERS")
+    print(f"{'=' * 80}")
+
+    X_geo = df[['LATITUDE', 'LONGITUDE']].dropna()
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_geo)
+
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    df.loc[X_geo.index, 'GEO_CLUSTER'] = kmeans.fit_predict(X_scaled)
+    df['GEO_CLUSTER'] = df['GEO_CLUSTER'].fillna(df['GEO_CLUSTER'].mode()[0]).astype(int)
+
+    cluster_stats = df.groupby('GEO_CLUSTER')[Y_COL].agg(['mean', 'count'])
+    print(f"✓ Created {n_clusters} clusters")
+    print(f"  Price range: ${cluster_stats['mean'].min():,.0f} - ${cluster_stats['mean'].max():,.0f}")
+
+    return df
+
+
+def prepare_econml_data(df, treatment_col):
+    """
+    Prepare data for EconML causal estimation
+
+    Returns: Y, T, X, W
+    """
+    print(f"\n{'=' * 80}")
+    print(f"PREPARING DATA FOR CAUSAL ANALYSIS: {TREATMENTS[treatment_col]['name']}")
+    print(f"{'=' * 80}")
+
+    # Create price level categories
+    df['PRICE_LEVEL'] = pd.qcut(df[Y_COL], q=3, labels=['Low', 'Mid', 'High'], duplicates='drop')
+    df['PRICE_LEVEL'] = df['PRICE_LEVEL'].cat.codes
+
+    # Center year variables
+    for col in ['YEAR', 'YEARBUILT_COAL', 'EFFECTIVEYEARBUILT_COAL']:
+        if col in df.columns:
+            df[f'{col}_CENTERED'] = df[col] - df[col].mean()
+
+    # Prepare confounders (exclude treatment)
+    confounder_cols = [c for c in CONFOUNDERS if c in df.columns and c != treatment_col]
+    confounder_cols = [f'{c}_CENTERED' if f'{c}_CENTERED' in df.columns else c
+                       for c in confounder_cols]
+
+    # Prepare effect modifiers
+    modifier_cols = [c for c in EFFECT_MODIFIERS if c in df.columns]
+    modifier_cols = [f'{c}_CENTERED' if f'{c}_CENTERED' in df.columns else c
+                     for c in modifier_cols]
+
+    # Select data
+    all_cols = [Y_COL, treatment_col] + confounder_cols + modifier_cols
+    df_analysis = df[all_cols].dropna()
+
+    # Remove outliers
+    q01, q99 = df_analysis[Y_COL].quantile([0.01, 0.99])
+    df_analysis = df_analysis[(df_analysis[Y_COL] >= q01) & (df_analysis[Y_COL] <= q99)]
+
+    Y = df_analysis[Y_COL].values
+    T = df_analysis[treatment_col].values
+    W = df_analysis[confounder_cols].values if confounder_cols else None
+    X = df_analysis[modifier_cols].values
+
+    print(f"\n📊 Data Summary:")
+    print(f"  Outcome (Y): {Y_COL}")
+    print(f"  Treatment (T): {treatment_col}")
+    print(f"  Confounders (W): {len(confounder_cols)} variables")
+    print(f"  Effect Modifiers (X): {len(modifier_cols)} variables")
+    print(f"  Sample size: {len(Y):,}")
+    print(f"  Treatment range: {T.min():.0f} - {T.max():.0f}")
+    print(f"  Treatment mean: {T.mean():.2f}")
+
+    return {
+        'Y': Y,
+        'T': T.reshape(-1, 1),  # EconML expects 2D
+        'W': W,
+        'X': X,
+        'df': df_analysis,
+        'confounder_names': confounder_cols,
+        'modifier_names': modifier_cols,
+        'treatment_name': treatment_col
+    }
+
+
+# ============================================================================
+# CAUSAL ESTIMATION WITH ECONML
+# ============================================================================
+
+def estimate_heterogeneous_effects(data, method='causal_forest'):
+    """
+    Estimate heterogeneous treatment effects using EconML
+    """
+    if not ECONML_AVAILABLE:
+        print("❌ EconML not available")
+        return None, None
+
+    print(f"\n{'=' * 80}")
+    print(f"ESTIMATING CAUSAL EFFECTS: {method.upper()}")
+    print(f"{'=' * 80}")
+
+    Y, T, X, W = data['Y'], data['T'], data['X'], data['W']
+
+    # Choose estimator
+    if method == 'causal_forest':
+        print("Using Causal Forest DML (discovers heterogeneity automatically)")
+        model = CausalForestDML(
+            model_y=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
+            model_t=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
+            n_estimators=100,
+            min_samples_leaf=50,
+            max_depth=8,
+            random_state=42,
+            verbose=0
+        )
+    elif method == 'linear_dml':
+        print("Using Linear DML (assumes linear heterogeneity)")
+        model = LinearDML(
+            model_y=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
+            model_t=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
+            random_state=42
+        )
+    elif method == 'dr_learner':
+        print("Using Doubly Robust Learner")
+        model = DRLearner(
+            model_regression=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
+            model_propensity=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
+            random_state=42
+        )
+
+    # Fit model
+    print("\n🔄 Fitting causal model (this may take 2-3 minutes)...")
+    if W is not None:
+        model.fit(Y, T, X=X, W=W)
+    else:
+        model.fit(Y, T, X=X)
+
+    print("✓ Model fitted successfully!")
+
+    # Estimate effects
+    print("\n📊 Estimating treatment effects...")
+    effects = model.effect(X)  # Point estimates
+
+    # Get confidence intervals
+    print("📊 Computing confidence intervals...")
+    effects_lower, effects_upper = model.effect_interval(X, alpha=1 - CONFIDENCE_LEVEL)
+
+    print(f"✓ Effects estimated for {len(effects):,} properties")
+
+    return model, {
+        'effects': effects.flatten(),
+        'effects_lower': effects_lower.flatten(),
+        'effects_upper': effects_upper.flatten(),
+        'X': X,
+        'df': data['df']
+    }
+
+
+# ============================================================================
+# ANALYZE EFFECTS BY CLUSTER
+# ============================================================================
+
+def analyze_effects_by_cluster(effects_dict, data, treatment_info):
+    """
+    Analyze how treatment effects vary by geographic cluster
+    """
+    print(f"\n{'=' * 80}")
+    print(f"HETEROGENEOUS EFFECTS BY CLUSTER: {treatment_info['name']}")
+    print(f"{'=' * 80}")
+
+    df = data['df'].copy()
+    df['treatment_effect'] = effects_dict['effects']
+    df['effect_lower'] = effects_dict['effects_lower']
+    df['effect_upper'] = effects_dict['effects_upper']
+
+    # Get top clusters by frequency
+    top_clusters = df['GEO_CLUSTER'].value_counts().head(TOP_CLUSTERS_TO_ANALYZE).index
+
+    cluster_effects = []
+    for cluster_id in top_clusters:
+        cluster_data = df[df['GEO_CLUSTER'] == cluster_id]
+
+        avg_effect = cluster_data['treatment_effect'].mean()
+        median_effect = cluster_data['treatment_effect'].median()
+        std_effect = cluster_data['treatment_effect'].std()
+        ci_lower = cluster_data['effect_lower'].mean()
+        ci_upper = cluster_data['effect_upper'].mean()
+        n_properties = len(cluster_data)
+        avg_price = cluster_data[Y_COL].mean()
+
+        # Calculate ROI
+        renovation_cost = treatment_info['typical_cost']
+        roi = ((avg_effect - renovation_cost) / renovation_cost) * 100
+
+        cluster_effects.append({
+            'cluster': int(cluster_id),
+            'n_properties': n_properties,
+            'avg_price': avg_price,
+            'avg_effect': avg_effect,
+            'median_effect': median_effect,
+            'std_effect': std_effect,
+            'ci_lower': ci_lower,
+            'ci_upper': ci_upper,
+            'renovation_cost': renovation_cost,
+            'roi_pct': roi
+        })
+
+    cluster_df = pd.DataFrame(cluster_effects).sort_values('avg_effect', ascending=False)
+
+    print(f"\nTop {TOP_CLUSTERS_TO_ANALYZE} Clusters by Sample Size:")
+    print(f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Effect':>12} {'95% CI':>25} {'ROI':>8}")
+    print("-" * 95)
+
+    for _, row in cluster_df.iterrows():
+        ci_str = f"[${row['ci_lower']:>6,.0f}, ${row['ci_upper']:>6,.0f}]"
+        roi_str = f"{row['roi_pct']:>6.1f}%" if row['roi_pct'] > -100 else " <-100%"
+        print(f"Cluster {row['cluster']:<3} {row['n_properties']:>8,} "
+              f"${row['avg_price']:>11,.0f} ${row['avg_effect']:>11,.0f} "
+              f"{ci_str:>25} {roi_str:>8}")
+
+    # Interpretation
+    print(f"\n💡 Interpretation:")
+    best_cluster = cluster_df.iloc[0]
+    worst_cluster = cluster_df.iloc[-1]
+
+    print(f"\n🏆 Best ROI:")
+    print(
+        f"  Cluster {int(best_cluster['cluster'])}: Adding one {treatment_info['unit']} increases value by ${best_cluster['avg_effect']:,.0f}")
+    print(f"  Typical renovation cost: ${best_cluster['renovation_cost']:,.0f}")
+    print(f"  ROI: {best_cluster['roi_pct']:.1f}%")
+
+    print(f"\n📉 Worst ROI:")
+    print(
+        f"  Cluster {int(worst_cluster['cluster'])}: Adding one {treatment_info['unit']} increases value by ${worst_cluster['avg_effect']:,.0f}")
+    print(f"  Typical renovation cost: ${worst_cluster['renovation_cost']:,.0f}")
+    print(f"  ROI: {worst_cluster['roi_pct']:.1f}%")
+
+    effect_range = best_cluster['avg_effect'] - worst_cluster['avg_effect']
+    print(f"\n📊 Effect Heterogeneity:")
+    print(f"  Range of effects across clusters: ${effect_range:,.0f}")
+    print(
+        f"  This {treatment_info['unit']} is worth ${effect_range:,.0f} more in Cluster {int(best_cluster['cluster'])} vs Cluster {int(worst_cluster['cluster'])}")
+
+    return cluster_df
+
+
+def compare_renovation_options(all_results):
+    """
+    Compare ROI across different renovation types
+    """
+    print(f"\n{'=' * 80}")
+    print("RENOVATION COMPARISON: WHICH HAS BEST ROI?")
+    print(f"{'=' * 80}")
+
+    comparison = []
+    for treatment_col, results in all_results.items():
+        cluster_df = results['cluster_effects']
+        treatment_info = TREATMENTS[treatment_col]
+
+        # Overall averages
+        avg_effect = cluster_df['avg_effect'].mean()
+        best_effect = cluster_df['avg_effect'].max()
+        worst_effect = cluster_df['avg_effect'].min()
+        avg_roi = cluster_df['roi_pct'].mean()
+
+        comparison.append({
+            'renovation': treatment_info['name'],
+            'cost': treatment_info['typical_cost'],
+            'avg_effect': avg_effect,
+            'avg_roi': avg_roi,
+            'best_cluster_effect': best_effect,
+            'worst_cluster_effect': worst_effect,
+            'effect_range': best_effect - worst_effect
+        })
+
+    comp_df = pd.DataFrame(comparison).sort_values('avg_roi', ascending=False)
+
+    print(f"\n{'Renovation':<20} {'Cost':>10} {'Avg Effect':>12} {'Avg ROI':>10} {'Effect Range':>15}")
+    print("-" * 80)
+
+    for _, row in comp_df.iterrows():
+        print(f"{row['renovation']:<20} ${row['cost']:>9,} ${row['avg_effect']:>11,.0f} "
+              f"{row['avg_roi']:>9.1f}% ${row['effect_range']:>14,.0f}")
+
+    print(f"\n🎯 Recommendation:")
+    best_roi = comp_df.iloc[0]
+    print(f"  Best overall ROI: {best_roi['renovation']}")
+    print(
+        f"  Average return: ${best_roi['avg_effect']:,.0f} on ${best_roi['cost']:,.0f} investment ({best_roi['avg_roi']:.1f}% ROI)")
+
+    print(f"\n📊 Geographic Sensitivity:")
+    most_heterogeneous = comp_df.sort_values('effect_range', ascending=False).iloc[0]
+    print(f"  Most location-dependent: {most_heterogeneous['renovation']}")
+    print(f"  Effect varies by ${most_heterogeneous['effect_range']:,.0f} across clusters")
+    print(f"  → This renovation is highly sensitive to neighborhood!")
+
+    return comp_df
+
+
+def visualize_heterogeneous_effects(results, treatment_info):
+    """
+    Visualize treatment effect heterogeneity
+    """
+    cluster_df = results['cluster_effects']
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+    # 1. Treatment effects by cluster
+    ax1 = axes[0, 0]
+    cluster_df_sorted = cluster_df.sort_values('avg_effect')
+    colors = ['#2ecc71' if roi > 0 else '#e74c3c' for roi in cluster_df_sorted['roi_pct']]
+
+    bars = ax1.barh(range(len(cluster_df_sorted)), cluster_df_sorted['avg_effect'] / 1000, color=colors, alpha=0.7)
+    ax1.set_yticks(range(len(cluster_df_sorted)))
+    ax1.set_yticklabels([f"C{int(c)}" for c in cluster_df_sorted['cluster']], fontsize=9)
+    ax1.set_xlabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
+    ax1.set_title(f'Effect of Adding {treatment_info["name"]} by Cluster', fontsize=12, fontweight='bold')
+    ax1.axvline(x=treatment_info['typical_cost'] / 1000, color='red', linestyle='--', linewidth=2,
+                label='Renovation Cost')
+    ax1.legend()
+    ax1.grid(axis='x', alpha=0.3)
+
+    # 2. ROI by cluster
+    ax2 = axes[0, 1]
+    cluster_df_sorted_roi = cluster_df.sort_values('roi_pct')
+    colors_roi = ['#2ecc71' if roi > 0 else '#e74c3c' for roi in cluster_df_sorted_roi['roi_pct']]
+
+    ax2.barh(range(len(cluster_df_sorted_roi)), cluster_df_sorted_roi['roi_pct'], color=colors_roi, alpha=0.7)
+    ax2.set_yticks(range(len(cluster_df_sorted_roi)))
+    ax2.set_yticklabels([f"C{int(c)}" for c in cluster_df_sorted_roi['cluster']], fontsize=9)
+    ax2.set_xlabel('ROI (%)', fontsize=11, fontweight='bold')
+    ax2.set_title(f'ROI by Cluster', fontsize=12, fontweight='bold')
+    ax2.axvline(x=0, color='black', linestyle='--', linewidth=2)
+    ax2.grid(axis='x', alpha=0.3)
+
+    # 3. Effect vs Price Level
+    ax3 = axes[1, 0]
+    ax3.scatter(cluster_df['avg_price'] / 1000, cluster_df['avg_effect'] / 1000, s=100, alpha=0.6)
+    ax3.set_xlabel('Average Property Price ($1000s)', fontsize=11, fontweight='bold')
+    ax3.set_ylabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
+    ax3.set_title('Effect vs Property Price Level', fontsize=12, fontweight='bold')
+    ax3.grid(alpha=0.3)
+
+    # Add trend line
+    z = np.polyfit(cluster_df['avg_price'], cluster_df['avg_effect'], 1)
+    p = np.poly1d(z)
+    ax3.plot(cluster_df['avg_price'] / 1000, p(cluster_df['avg_price']) / 1000, "r--", alpha=0.8, linewidth=2)
+
+    # 4. Distribution of treatment effects
+    ax4 = axes[1, 1]
+    effects_data = results['effects_dict']['effects']
+    ax4.hist(effects_data / 1000, bins=50, alpha=0.7, color='#3498db', edgecolor='black')
+    ax4.axvline(x=effects_data.mean() / 1000, color='red', linestyle='--', linewidth=2,
+                label=f'Mean: ${effects_data.mean() / 1000:.1f}K')
+    ax4.axvline(x=treatment_info['typical_cost'] / 1000, color='orange', linestyle='--', linewidth=2,
+                label=f'Cost: ${treatment_info["typical_cost"] / 1000:.1f}K')
+    ax4.set_xlabel('Treatment Effect ($1000s)', fontsize=11, fontweight='bold')
+    ax4.set_ylabel('Frequency', fontsize=11, fontweight='bold')
+    ax4.set_title(f'Distribution of Treatment Effects', fontsize=12, fontweight='bold')
+    ax4.legend()
+    ax4.grid(alpha=0.3)
+
+    plt.tight_layout()
+    filename = f'causal_effects_{treatment_info["name"].lower().replace(" ", "_")}.png'
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"✓ Saved: {filename}")
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """
+    Main execution: Analyze causal effects for multiple renovation types
+    """
+    print("\n" + "=" * 80)
+    print(" " * 10 + "ECONML CAUSAL ANALYSIS: RENOVATION ROI BY AREA")
+    print("=" * 80)
+
+    # Load and prepare data
+    print("\n[1/5] Loading and preparing data...")
+    df = pd.read_parquet(DATA_PATH)
+
+    if IS_PANEL_DATA:
+        df = collapse_to_property_level(df, DECAY_FACTOR)
+
+    df = create_geo_clusters(df)
+
+    # Analyze each treatment
+    all_results = {}
+
+    print(f"\n[2/5] Analyzing {len(TREATMENTS)} renovation types...")
+
+    for treatment_col, treatment_info in TREATMENTS.items():
+        if treatment_col not in df.columns:
+            print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
+            continue
+
+        print(f"\n{'=' * 80}")
+        print(f"ANALYZING: {treatment_info['name']}")
+        print(f"{'=' * 80}")
+
+        # Prepare data
+        data = prepare_econml_data(df, treatment_col)
+
+        # Estimate effects
+        model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
+
+        if model is None:
+            continue
+
+        # Analyze by cluster
+        cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
+
+        # Visualize
+        visualize_heterogeneous_effects(
+            {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
+            treatment_info
+        )
+
+        all_results[treatment_col] = {
+            'model': model,
+            'effects_dict': effects_dict,
+            'cluster_effects': cluster_df,
+            'treatment_info': treatment_info
+        }
+
+    # Compare renovations
+    if len(all_results) > 1:
+        print(f"\n[3/5] Comparing renovation options...")
+        comparison_df = compare_renovation_options(all_results)
+
+        # Save comparison
+        comparison_df.to_csv('renovation_comparison.csv', index=False)
+        print("\n✓ Saved: renovation_comparison.csv")
+
+    # Save all cluster effects
+    print(f"\n[4/5] Saving detailed results...")
+    for treatment_col, results in all_results.items():
+        filename = f"cluster_effects_{treatment_col.lower()}.csv"
+        results['cluster_effects'].to_csv(filename, index=False)
+        print(f"✓ Saved: {filename}")
+
+    print(f"\n[5/5] Creating summary report...")
+    create_summary_report(all_results)
+
+    print(f"\n{'=' * 80}")
+    print("✅ CAUSAL ANALYSIS COMPLETE!")
+    print(f"{'=' * 80}")
+
+    return all_results
+
+def create_summary_report(all_results):
+    """Create executive summary report"""
+    with open('causal_analysis_summary.txt', 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("CAUSAL ANALYSIS SUMMARY: RENOVATION ROI BY GEOGRAPHIC AREA\n")
+        f.write("=" * 80 + "\n\n")
+
+        for treatment_col, results in all_results.items():
+            treatment_info = results['treatment_info']
+            cluster_df = results['cluster_effects']
+
+            f.write(f"\n{treatment_info['name'].upper()}\n")
+            f.write("-" * 80 + "\n")
+
+            best = cluster_df.iloc[0]
+            worst = cluster_df.iloc[-1]
+
+            f.write(f"\nBest ROI:\n")
+            f.write(f"  Cluster {int(best['cluster'])}: ${best['avg_effect']:,.0f} value increase\n")
+            f.write(f"  Cost: ${best['renovation_cost']:,.0f}\n")
+            f.write(f"  ROI: {best['roi_pct']:.1f}%\n")
+
+            f.write(f"\nWorst ROI:\n")
+            f.write(f"  Cluster {int(worst['cluster'])}: ${worst['avg_effect']:,.0f} value increase\n")
+            f.write(f"  ROI: {worst['roi_pct']:.1f}%\n")
+
+            f.write(f"\nHeterogeneity:\n")
+            f.write(f"  Effect range: ${best['avg_effect'] - worst['avg_effect']:,.0f}\n")
+            f.write(f"  Standard deviation: ${cluster_df['avg_effect'].std():,.0f}\n")
+
+            f.write("\n")
+
+    print("✓ Saved: causal_analysis_summary.txt")
+
+if __name__ == "__main__":
+    if not ECONML_AVAILABLE:
+        print("\n❌ ERROR: EconML not installed")
+        print("Install with: pip install econml")
+        print("Then run this script again")
+    else:
+        results = main()
