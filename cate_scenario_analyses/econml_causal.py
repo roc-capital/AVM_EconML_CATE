@@ -31,11 +31,21 @@ except ImportError:
     print("⚠️ EconML not installed. Install with: pip install econml")
     ECONML_AVAILABLE = False
 
+# Add this import at the top with other imports
+try:
+    from dowhy import CausalModel
+    DOWHY_AVAILABLE = True
+except ImportError:
+    DOWHY_AVAILABLE = False
+
+# Add this configuration variable with other config
+RUN_DOWHY_VALIDATION = True
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 
-DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df.parquet"
+DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df_cleaned_deduplicated.parquet"
 
 IS_PANEL_DATA = True
 PROPERTYID_COL = "PROPERTYID"
@@ -131,27 +141,6 @@ def collapse_to_property_level(df, decay=0.9):
     df_property = df_last.merge(df_saleamt, on=PROPERTYID_COL, how="left")
     print(f"✓ Collapsed to {len(df_property):,} properties")
     return df_property
-
-
-def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS):
-    """Create geographic clusters"""
-    print(f"\n{'=' * 80}")
-    print(f"CREATING {n_clusters} GEOGRAPHIC CLUSTERS")
-    print(f"{'=' * 80}")
-
-    X_geo = df[['LATITUDE', 'LONGITUDE']].dropna()
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_geo)
-
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    df.loc[X_geo.index, 'GEO_CLUSTER'] = kmeans.fit_predict(X_scaled)
-    df['GEO_CLUSTER'] = df['GEO_CLUSTER'].fillna(df['GEO_CLUSTER'].mode()[0]).astype(int)
-
-    cluster_stats = df.groupby('GEO_CLUSTER')[Y_COL].agg(['mean', 'count'])
-    print(f"✓ Created {n_clusters} clusters")
-    print(f"  Price range: ${cluster_stats['mean'].min():,.0f} - ${cluster_stats['mean'].max():,.0f}")
-
-    return df
 
 
 def prepare_econml_data(df, treatment_col):
@@ -487,92 +476,6 @@ def visualize_heterogeneous_effects(results, treatment_info):
     print(f"✓ Saved: {filename}")
 
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
-def main():
-    """
-    Main execution: Analyze causal effects for multiple renovation types
-    """
-    print("\n" + "=" * 80)
-    print(" " * 10 + "ECONML CAUSAL ANALYSIS: RENOVATION EFFECTS BY AREA")
-    print("=" * 80)
-
-    # Load and prepare data
-    print("\n[1/5] Loading and preparing data...")
-    df = pd.read_parquet(DATA_PATH)
-
-    if IS_PANEL_DATA:
-        df = collapse_to_property_level(df, DECAY_FACTOR)
-
-    df = create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=PRICE_WEIGHT)
-
-    # Analyze each treatment
-    all_results = {}
-
-    print(f"\n[2/5] Analyzing {len(TREATMENTS)} renovation types...")
-
-    for treatment_col, treatment_info in TREATMENTS.items():
-        if treatment_col not in df.columns:
-            print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
-            continue
-
-        print(f"\n{'=' * 80}")
-        print(f"ANALYZING: {treatment_info['name']}")
-        print(f"{'=' * 80}")
-
-        # Prepare data
-        data = prepare_econml_data(df, treatment_col)
-
-        # Estimate effects
-        model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
-
-        if model is None:
-            continue
-
-        # Analyze by cluster
-        cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
-
-        # Visualize
-        visualize_heterogeneous_effects(
-            {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
-            treatment_info
-        )
-
-        all_results[treatment_col] = {
-            'model': model,
-            'effects_dict': effects_dict,
-            'cluster_effects': cluster_df,
-            'treatment_info': treatment_info
-        }
-
-    # Compare renovations
-    if len(all_results) > 1:
-        print(f"\n[3/5] Comparing renovation options...")
-        comparison_df = compare_renovation_options(all_results)
-
-        # Save comparison
-        comparison_df.to_csv('renovation_comparison.csv', index=False)
-        print("\n✓ Saved: renovation_comparison.csv")
-
-    # Save all cluster effects
-    print(f"\n[4/5] Saving detailed results...")
-    for treatment_col, results in all_results.items():
-        filename = f"cluster_effects_{treatment_col.lower()}.csv"
-        results['cluster_effects'].to_csv(filename, index=False)
-        print(f"✓ Saved: {filename}")
-
-    print(f"\n[5/5] Creating summary report...")
-    create_summary_report(all_results)
-
-    print(f"\n{'=' * 80}")
-    print("✅ CAUSAL ANALYSIS COMPLETE!")
-    print(f"{'=' * 80}")
-
-    return all_results
-
-
 def create_summary_report(all_results):
     """Create executive summary report"""
     with open('causal_analysis_summary.txt', 'w') as f:
@@ -604,53 +507,73 @@ def create_summary_report(all_results):
 
     print("✓ Saved: causal_analysis_summary.txt")
 
-
-def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=0.3):
+def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS,
+                        price_weight=0.3,
+                        sqft_weight=0.2,
+                        sqft_col='LIVINGAREASQFT_COAL'):
     """
-    Create geographic clusters using both location and price
+    Create geographic clusters using location, price, and square footage
 
     Parameters:
     -----------
     df : DataFrame
-        Data with LATITUDE, LONGITUDE, and price columns
+        Data with LATITUDE, LONGITUDE, price, and sqft columns
     n_clusters : int
         Number of clusters to create
     price_weight : float (0 to 1)
-        Weight for price vs location.
-        0 = pure geographic clustering
-        1 = pure price clustering
-        0.3 = 30% price, 70% location (recommended)
+        Weight for price in clustering
+    sqft_weight : float (0 to 1)
+        Weight for square footage in clustering
+    sqft_col : str
+        Column name for square footage (default: 'LIVINGAREASQFT_COAL')
+
+    Note: Remaining weight goes to location (lat/lon)
+    Example: price=0.3, sqft=0.2 → location gets 0.5 (50%)
     """
+    # Calculate location weight
+    location_weight = 1.0 - price_weight - sqft_weight
+
+    if location_weight < 0:
+        raise ValueError(
+            f"Weights sum to more than 1.0! price_weight({price_weight}) + sqft_weight({sqft_weight}) = {price_weight + sqft_weight}")
+
     print(f"\n{'=' * 80}")
-    print(f"CREATING {n_clusters} GEO-PRICE CLUSTERS")
+    print(f"CREATING {n_clusters} GEO-PRICE-SQFT CLUSTERS")
     print(f"{'=' * 80}")
+    print(f"  Location weight: {location_weight:.1%}")
     print(f"  Price weight: {price_weight:.1%}")
-    print(f"  Location weight: {(1 - price_weight):.1%}")
+    print(f"  Sqft weight: {sqft_weight:.1%}")
 
     # Prepare features
-    required_cols = ['LATITUDE', 'LONGITUDE', Y_COL]
+    required_cols = ['LATITUDE', 'LONGITUDE', Y_COL, sqft_col]
     X_data = df[required_cols].dropna()
 
-    # Separate geographic and price features
+    print(f"\n  Properties with complete data: {len(X_data):,} ({len(X_data) / len(df) * 100:.1f}%)")
+
+    # Separate features
     X_geo = X_data[['LATITUDE', 'LONGITUDE']].values
     X_price = X_data[[Y_COL]].values
+    X_sqft = X_data[[sqft_col]].values
 
     # Standardize separately to control weighting
     scaler_geo = StandardScaler()
     scaler_price = StandardScaler()
+    scaler_sqft = StandardScaler()
 
     X_geo_scaled = scaler_geo.fit_transform(X_geo)
     X_price_scaled = scaler_price.fit_transform(X_price)
+    X_sqft_scaled = scaler_sqft.fit_transform(X_sqft)
 
-    # Combine with weighting
-    # Location gets (1-price_weight), price gets price_weight
-    X_geo_weighted = X_geo_scaled * (1 - price_weight)
+    # Apply weights
+    X_geo_weighted = X_geo_scaled * location_weight
     X_price_weighted = X_price_scaled * price_weight
+    X_sqft_weighted = X_sqft_scaled * sqft_weight
 
-    # Concatenate
-    X_combined = np.hstack([X_geo_weighted, X_price_weighted])
+    # Concatenate all features
+    X_combined = np.hstack([X_geo_weighted, X_price_weighted, X_sqft_weighted])
 
     # Fit K-means
+    print(f"\n  Fitting K-means with {n_clusters} clusters...")
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
     df.loc[X_data.index, 'GEO_CLUSTER'] = kmeans.fit_predict(X_combined)
     df['GEO_CLUSTER'] = df['GEO_CLUSTER'].fillna(df['GEO_CLUSTER'].mode()[0]).astype(int)
@@ -658,6 +581,7 @@ def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=0.3):
     # Analyze clusters
     cluster_stats = df.groupby('GEO_CLUSTER').agg({
         Y_COL: ['mean', 'std', 'min', 'max', 'count'],
+        sqft_col: ['mean', 'std', 'min', 'max'],
         'LATITUDE': ['mean', 'std'],
         'LONGITUDE': ['mean', 'std']
     }).round(2)
@@ -665,23 +589,298 @@ def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=0.3):
     print(f"\n✓ Created {n_clusters} clusters")
     print(f"\nCluster Statistics:")
     print(f"  Price range: ${cluster_stats[(Y_COL, 'mean')].min():,.0f} - ${cluster_stats[(Y_COL, 'mean')].max():,.0f}")
+    print(
+        f"  Sqft range: {cluster_stats[(sqft_col, 'mean')].min():,.0f} - {cluster_stats[(sqft_col, 'mean')].max():,.0f} sqft")
     print(f"  Avg within-cluster price std: ${cluster_stats[(Y_COL, 'std')].mean():,.0f}")
+    print(f"  Avg within-cluster sqft std: {cluster_stats[(sqft_col, 'std')].mean():,.0f} sqft")
     print(f"  Avg properties per cluster: {cluster_stats[(Y_COL, 'count')].mean():.0f}")
 
     # Show example clusters
     print(f"\nExample Clusters (Top 5 by size):")
-    print(f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Price Std':>12} {'Lat':>8} {'Lon':>8}")
-    print("-" * 75)
+    print(
+        f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Avg Sqft':>10} {'Price Std':>11} {'Sqft Std':>10} {'Lat':>8} {'Lon':>8}")
+    print("-" * 95)
 
     top_clusters = cluster_stats.nlargest(5, (Y_COL, 'count'))
     for idx in top_clusters.index:
         row = cluster_stats.loc[idx]
         print(f"Cluster {idx:<3} {int(row[(Y_COL, 'count')]):>8,} "
-              f"${row[(Y_COL, 'mean')]:>11,.0f} ${row[(Y_COL, 'std')]:>11,.0f} "
+              f"${row[(Y_COL, 'mean')]:>11,.0f} {row[(sqft_col, 'mean')]:>9,.0f} "
+              f"${row[(Y_COL, 'std')]:>10,.0f} {row[(sqft_col, 'std')]:>9,.0f} "
               f"{row[('LATITUDE', 'mean')]:>7.3f} {row[('LONGITUDE', 'mean')]:>7.3f}")
 
     return df
 
+
+def validate_with_dowhy(data, treatment_col, treatment_info):
+    """
+    Validate causal estimates using DoWhy framework
+
+    Parameters:
+    -----------
+    data : dict
+        Output from prepare_econml_data()
+    treatment_col : str
+        Name of treatment variable
+    treatment_info : dict
+        Treatment metadata from TREATMENTS dict
+
+    Returns:
+    --------
+    dict with DoWhy results, or None if validation fails/skipped
+    """
+    if not DOWHY_AVAILABLE:
+        print("⚠️ DoWhy not available - skipping validation")
+        return None
+
+    print(f"\n{'=' * 80}")
+    print(f"DOWHY VALIDATION: {treatment_info['name']}")
+    print(f"{'=' * 80}")
+
+    try:
+        # Prepare data
+        df_dowhy = data['df'].copy()
+        df_dowhy[treatment_col] = data['T'].flatten()
+        df_dowhy[Y_COL] = data['Y']
+
+        # Build causal graph
+        confounder_names = data['confounder_names']
+
+        print(f"\n📐 Building Causal DAG...")
+        print(f"   Treatment: {treatment_col}")
+        print(f"   Outcome: {Y_COL}")
+        print(f"   Confounders: {len(confounder_names)}")
+
+        # Create graph edges
+        graph_edges = []
+        for conf in confounder_names:
+            graph_edges.append(f'        {conf} -> {treatment_col};')
+            graph_edges.append(f'        {conf} -> {Y_COL};')
+        graph_edges.append(f'        {treatment_col} -> {Y_COL};')
+
+        graph = "digraph {\n" + "\n".join(graph_edges) + "\n    }"
+
+        # Create causal model
+        model = CausalModel(
+            data=df_dowhy,
+            treatment=treatment_col,
+            outcome=Y_COL,
+            graph=graph
+        )
+
+        # Identify effect
+        print("\n[STEP 1] Identifying causal effect...")
+        identified_estimand = model.identify_effect(proceed_when_unidentifiable=True)
+
+        # Estimate with linear regression (fast baseline)
+        print("\n[STEP 2] Estimating with linear regression...")
+        estimate = model.estimate_effect(
+            identified_estimand,
+            method_name="backdoor.linear_regression",
+            test_significance=True
+        )
+
+        print(f"✓ Estimate: ${estimate.value:,.0f}")
+
+        # Refutation tests
+        print("\n[STEP 3] Running refutation tests...")
+        refutations = {}
+
+        # Placebo test
+        print("  → Placebo treatment test...")
+        try:
+            refute_placebo = model.refute_estimate(
+                identified_estimand, estimate,
+                method_name="placebo_treatment_refuter",
+                num_simulations=20  # Reduced for speed
+            )
+            refutations['placebo'] = {
+                'new_effect': refute_placebo.new_effect,
+                'p_value': refute_placebo.refutation_result.get('p_value', None)
+            }
+            print(f"     Placebo effect: ${refute_placebo.new_effect:,.0f}")
+        except Exception as e:
+            print(f"     Failed: {e}")
+            refutations['placebo'] = None
+
+        # Random common cause
+        print("  → Random common cause test...")
+        try:
+            refute_random = model.refute_estimate(
+                identified_estimand, estimate,
+                method_name="random_common_cause",
+                num_simulations=20
+            )
+            refutations['random_common_cause'] = {
+                'new_effect': refute_random.new_effect,
+                'p_value': refute_random.refutation_result.get('p_value', None)
+            }
+            pct_change = abs((refute_random.new_effect - estimate.value) / estimate.value) * 100
+            print(f"     Changed by: {pct_change:.1f}%")
+        except Exception as e:
+            print(f"     Failed: {e}")
+            refutations['random_common_cause'] = None
+
+        # Data subset
+        print("  → Data subset test...")
+        try:
+            refute_subset = model.refute_estimate(
+                identified_estimand, estimate,
+                method_name="data_subset_refuter",
+                subset_fraction=0.9,
+                num_simulations=20
+            )
+            refutations['data_subset'] = {
+                'new_effect': refute_subset.new_effect,
+                'p_value': refute_subset.refutation_result.get('p_value', None)
+            }
+            pct_change = abs((refute_subset.new_effect - estimate.value) / estimate.value) * 100
+            print(f"     Changed by: {pct_change:.1f}%")
+        except Exception as e:
+            print(f"     Failed: {e}")
+            refutations['data_subset'] = None
+
+        print("\n✓ DoWhy validation complete")
+
+        return {
+            'model': model,
+            'identified_estimand': identified_estimand,
+            'estimate': estimate.value,
+            'refutations': refutations
+        }
+
+    except Exception as e:
+        print(f"\n❌ DoWhy validation failed: {e}")
+        return None
+
+def save_dowhy_summary(all_results):
+    """Save DoWhy validation results to file"""
+    if not any(r.get('dowhy_validation') for r in all_results.values()):
+        print("  (No DoWhy validations to save)")
+        return
+
+    with open('dowhy_validation_summary.txt', 'w') as f:
+        f.write("=" * 80 + "\n")
+        f.write("DOWHY VALIDATION SUMMARY\n")
+        f.write("=" * 80 + "\n\n")
+
+        for treatment_col, results in all_results.items():
+            dowhy = results.get('dowhy_validation')
+            if not dowhy:
+                continue
+
+            treatment_info = results['treatment_info']
+            f.write(f"\n{treatment_info['name'].upper()}\n")
+            f.write("-" * 80 + "\n")
+
+            f.write(f"\nLinear Regression Estimate: ${dowhy['estimate']:,.0f}\n")
+
+            f.write(f"\nRefutation Tests:\n")
+            for test_name, test_result in dowhy['refutations'].items():
+                if test_result:
+                    f.write(f"  {test_name}: ${test_result['new_effect']:,.0f}")
+                    if test_result.get('p_value'):
+                        f.write(f" (p={test_result['p_value']:.4f})")
+                    f.write("\n")
+
+            f.write("\n")
+
+    print("✓ Saved: dowhy_validation_summary.txt")
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """
+    Main execution: Analyze causal effects for multiple renovation types
+    """
+    print("\n" + "=" * 80)
+    print(" " * 10 + "ECONML CAUSAL ANALYSIS: RENOVATION EFFECTS BY AREA")
+    print("=" * 80)
+
+    # Load and prepare data
+    print("\n[1/6] Loading and preparing data...")
+    df = pd.read_parquet(DATA_PATH)
+
+    if IS_PANEL_DATA:
+        df = collapse_to_property_level(df, DECAY_FACTOR)
+
+    df = create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=PRICE_WEIGHT)
+
+    # Analyze each treatment
+    all_results = {}
+
+    print(f"\n[2/6] Analyzing {len(TREATMENTS)} renovation types...")
+
+    for treatment_col, treatment_info in TREATMENTS.items():
+        if treatment_col not in df.columns:
+            print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
+            continue
+
+        print(f"\n{'=' * 80}")
+        print(f"ANALYZING: {treatment_info['name']}")
+        print(f"{'=' * 80}")
+
+        # Prepare data
+        data = prepare_econml_data(df, treatment_col)
+
+        # Estimate effects
+        model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
+
+        if model is None:
+            continue
+
+        # Analyze by cluster
+        cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
+
+        # **NEW: DoWhy validation**
+        dowhy_results = None
+        if RUN_DOWHY_VALIDATION:
+            dowhy_results = validate_with_dowhy(data, treatment_col, treatment_info)
+
+        # Visualize
+        visualize_heterogeneous_effects(
+            {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
+            treatment_info
+        )
+
+        all_results[treatment_col] = {
+            'model': model,
+            'effects_dict': effects_dict,
+            'cluster_effects': cluster_df,
+            'treatment_info': treatment_info,
+            'dowhy_validation': dowhy_results  # **NEW: Store DoWhy results**
+        }
+
+    # Compare renovations
+    if len(all_results) > 1:
+        print(f"\n[3/6] Comparing renovation options...")
+        comparison_df = compare_renovation_options(all_results)
+
+        # Save comparison
+        comparison_df.to_csv('renovation_comparison.csv', index=False)
+        print("\n✓ Saved: renovation_comparison.csv")
+
+    # Save all cluster effects
+    print(f"\n[4/6] Saving detailed results...")
+    for treatment_col, results in all_results.items():
+        filename = f"cluster_effects_{treatment_col.lower()}.csv"
+        results['cluster_effects'].to_csv(filename, index=False)
+        print(f"✓ Saved: {filename}")
+
+    # **NEW: Save DoWhy validation summary**
+    print(f"\n[5/6] Saving validation summary...")
+    save_dowhy_summary(all_results)
+
+    print(f"\n[6/6] Creating summary report...")
+    create_summary_report(all_results)
+
+    print(f"\n{'=' * 80}")
+    print("✅ CAUSAL ANALYSIS COMPLETE!")
+    print(f"{'=' * 80}")
+
+    return all_results
 
 if __name__ == "__main__":
     if not ECONML_AVAILABLE:
