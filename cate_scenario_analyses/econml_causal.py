@@ -34,6 +34,7 @@ except ImportError:
 # Add this import at the top with other imports
 try:
     from dowhy import CausalModel
+
     DOWHY_AVAILABLE = True
 except ImportError:
     DOWHY_AVAILABLE = False
@@ -45,31 +46,31 @@ RUN_DOWHY_VALIDATION = True
 # CONFIGURATION
 # ============================================================================
 
-DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df_cleaned_deduplicated.parquet"
+DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df_with_census_edu.parquet"
 
 IS_PANEL_DATA = True
-PROPERTYID_COL = "PROPERTYID"
+PROPERTYID_COL = "propertyid"
 DECAY_FACTOR = 0.9
-Y_COL = "SALEAMT"
+Y_COL = "saleamt"
 
 # TREATMENTS: What renovations are we analyzing?
 TREATMENTS = {
-    'HALF_BATHS_COAL': {
+    'half_baths_coal': {
         'name': 'Half Bathroom',
         'unit': 'bathroom',
         'typical_cost': 5000,  # Typical renovation cost (for reference only)
     },
-    'BEDROOMS_MLS': {
+    'bedrooms_mls': {
         'name': 'Bedroom',
         'unit': 'bedroom',
         'typical_cost': 15000,
     },
-    'GARAGE_SPACES_COAL': {
+    'garage_spaces_coal': {
         'name': 'Garage Space',
         'unit': 'space',
         'typical_cost': 12000,
     },
-    'FULL_BATHS_COAL': {
+    'full_baths_coal': {
         'name': 'Full Bathroom',
         'unit': 'bathroom',
         'typical_cost': 10000,
@@ -78,20 +79,25 @@ TREATMENTS = {
 
 # CONFOUNDERS: What affects both treatment and outcome?
 CONFOUNDERS = [
-    'LIVINGAREASQFT_COAL',  # Size affects both # of rooms and price
-    'LOTSIZESQFT_COAL',
-    'YEARBUILT_COAL',
-    'EFFECTIVEYEARBUILT_COAL',
-    'FIREPLACE_COUNT_MLS',
-    'YEAR',
+    'livingareasqft_coal',  # Size affects both # of rooms and price
+    'lotsizesqft_coal',
+    'yearbuilt_coal',
+    'effectiveyearbuilt_coal',
+    'fireplace_count_mls',
+    'year',
+    'total_population_25plus',
+    'male_high_school_graduate',
+    'female_high_school_graduate',
+    'male_bachelors_degree',
+    'female_bachelors_degree'
 ]
 
 # EFFECT MODIFIERS: What makes treatment effects vary?
 EFFECT_MODIFIERS = [
-    'GEO_CLUSTER',  # Key: effects vary by location!
-    'LIVINGAREASQFT_COAL',  # Effects vary by house size
-    'YEARBUILT_COAL',  # Effects vary by house age
-    'PRICE_LEVEL',  # Effects vary by price tier
+    'geo_cluster',  # Key: effects vary by location!
+    'livingareasqft_coal',  # Effects vary by house size
+    'yearbuilt_coal',  # Effects vary by house age
+    'price_level',  # Effects vary by price tier
 ]
 
 # Geographic clustering
@@ -119,24 +125,27 @@ def collapse_to_property_level(df, decay=0.9):
     print(f"{'=' * 80}")
 
     last_cols = [c for c in [
-        "YEAR", "BEDROOMS_MLS", "FULL_BATHS_COAL", "HALF_BATHS_COAL",
-        "LIVINGAREASQFT_COAL", "LOTSIZESQFT_COAL",
-        "YEARBUILT_COAL", "EFFECTIVEYEARBUILT_COAL",
-        "GARAGE_SPACES_COAL", "FIREPLACE_COUNT_MLS",
-        "LATITUDE", "LONGITUDE"
+        "year", "bedrooms_mls", "full_baths_coal", "half_baths_coal",
+        "livingareasqft_coal", "lotsizesqft_coal",
+        "yearbuilt_coal", "effectiveyearbuilt_coal",
+        "garage_spaces_coal", "fireplace_count_mls",
+        "latitude", "longitude",
+        "total_population_25plus", "male_high_school_graduate",
+        "female_high_school_graduate", "male_bachelors_degree",
+        "female_bachelors_degree"
     ] if c in df.columns]
 
-    df_sorted = df.sort_values([PROPERTYID_COL, "YEAR"])
+    df_sorted = df.sort_values([PROPERTYID_COL, "year"])
     df_last = df_sorted.groupby(PROPERTYID_COL, as_index=False)[last_cols].last()
 
     def discounted_saleamt(group):
-        max_year = group["YEAR"].max()
-        weights = decay ** (max_year - group["YEAR"])
-        return np.average(group["SALEAMT"], weights=weights)
+        max_year = group["year"].max()
+        weights = decay ** (max_year - group["year"])
+        return np.average(group["saleamt"], weights=weights)
 
     df_saleamt = (df_sorted.groupby(PROPERTYID_COL)
                   .apply(discounted_saleamt)
-                  .rename("SALEAMT").reset_index())
+                  .rename("saleamt").reset_index())
 
     df_property = df_last.merge(df_saleamt, on=PROPERTYID_COL, how="left")
     print(f"✓ Collapsed to {len(df_property):,} properties")
@@ -154,22 +163,22 @@ def prepare_econml_data(df, treatment_col):
     print(f"{'=' * 80}")
 
     # Create price level categories
-    df['PRICE_LEVEL'] = pd.qcut(df[Y_COL], q=3, labels=['Low', 'Mid', 'High'], duplicates='drop')
-    df['PRICE_LEVEL'] = df['PRICE_LEVEL'].cat.codes
+    df['price_level'] = pd.qcut(df[Y_COL], q=3, labels=['Low', 'Mid', 'High'], duplicates='drop')
+    df['price_level'] = df['price_level'].cat.codes
 
     # Center year variables
-    for col in ['YEAR', 'YEARBUILT_COAL', 'EFFECTIVEYEARBUILT_COAL']:
+    for col in ['year', 'yearbuilt_coal', 'effectiveyearbuilt_coal']:
         if col in df.columns:
-            df[f'{col}_CENTERED'] = df[col] - df[col].mean()
+            df[f'{col}_centered'] = df[col] - df[col].mean()
 
     # Prepare confounders (exclude treatment)
     confounder_cols = [c for c in CONFOUNDERS if c in df.columns and c != treatment_col]
-    confounder_cols = [f'{c}_CENTERED' if f'{c}_CENTERED' in df.columns else c
+    confounder_cols = [f'{c}_centered' if f'{c}_centered' in df.columns else c
                        for c in confounder_cols]
 
     # Prepare effect modifiers
     modifier_cols = [c for c in EFFECT_MODIFIERS if c in df.columns]
-    modifier_cols = [f'{c}_CENTERED' if f'{c}_CENTERED' in df.columns else c
+    modifier_cols = [f'{c}_centered' if f'{c}_centered' in df.columns else c
                      for c in modifier_cols]
 
     # Select data
@@ -297,11 +306,11 @@ def analyze_effects_by_cluster(effects_dict, data, treatment_info):
     df['effect_upper'] = effects_dict['effects_upper']
 
     # Get top clusters by frequency
-    top_clusters = df['GEO_CLUSTER'].value_counts().head(TOP_CLUSTERS_TO_ANALYZE).index
+    top_clusters = df['geo_cluster'].value_counts().head(TOP_CLUSTERS_TO_ANALYZE).index
 
     cluster_effects = []
     for cluster_id in top_clusters:
-        cluster_data = df[df['GEO_CLUSTER'] == cluster_id]
+        cluster_data = df[df['geo_cluster'] == cluster_id]
 
         avg_effect = cluster_data['treatment_effect'].mean()
         median_effect = cluster_data['treatment_effect'].median()
@@ -507,83 +516,101 @@ def create_summary_report(all_results):
 
     print("✓ Saved: causal_analysis_summary.txt")
 
+
 def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS,
-                        price_weight=0.3,
-                        sqft_weight=0.2,
-                        sqft_col='LIVINGAREASQFT_COAL'):
+                        price_weight=0.25,
+                        sqft_weight=0.15,
+                        education_weight=0.15,
+                        sqft_col='livingareasqft_coal'):
     """
-    Create geographic clusters using location, price, and square footage
+    Create geographic clusters using location, price, square footage, and education level
 
     Parameters:
     -----------
     df : DataFrame
-        Data with LATITUDE, LONGITUDE, price, and sqft columns
+        Data with latitude, longitude, price, sqft, and education columns
     n_clusters : int
         Number of clusters to create
     price_weight : float (0 to 1)
         Weight for price in clustering
     sqft_weight : float (0 to 1)
         Weight for square footage in clustering
+    education_weight : float (0 to 1)
+        Weight for education level (% with bachelor's degree or higher)
     sqft_col : str
-        Column name for square footage (default: 'LIVINGAREASQFT_COAL')
+        Column name for square footage (default: 'livingareasqft_coal')
 
     Note: Remaining weight goes to location (lat/lon)
-    Example: price=0.3, sqft=0.2 → location gets 0.5 (50%)
+    Example: price=0.25, sqft=0.15, education=0.15 → location gets 0.45 (45%)
     """
     # Calculate location weight
-    location_weight = 1.0 - price_weight - sqft_weight
+    location_weight = 1.0 - price_weight - sqft_weight - education_weight
 
     if location_weight < 0:
         raise ValueError(
-            f"Weights sum to more than 1.0! price_weight({price_weight}) + sqft_weight({sqft_weight}) = {price_weight + sqft_weight}")
+            f"Weights sum to more than 1.0! price({price_weight}) + sqft({sqft_weight}) + education({education_weight}) = {price_weight + sqft_weight + education_weight}")
 
     print(f"\n{'=' * 80}")
-    print(f"CREATING {n_clusters} GEO-PRICE-SQFT CLUSTERS")
+    print(f"CREATING {n_clusters} GEO-PRICE-SQFT-EDUCATION CLUSTERS")
     print(f"{'=' * 80}")
     print(f"  Location weight: {location_weight:.1%}")
     print(f"  Price weight: {price_weight:.1%}")
     print(f"  Sqft weight: {sqft_weight:.1%}")
+    print(f"  Education weight: {education_weight:.1%}")
+
+    # Calculate education metric: % with bachelor's degree or higher
+    df['pct_bachelors_plus'] = (
+                                       (df['male_bachelors_degree'] + df['female_bachelors_degree']) /
+                                       df['total_population_25plus']
+                               ).fillna(0) * 100  # Convert to percentage
 
     # Prepare features
-    required_cols = ['LATITUDE', 'LONGITUDE', Y_COL, sqft_col]
+    required_cols = ['latitude', 'longitude', Y_COL, sqft_col, 'pct_bachelors_plus']
     X_data = df[required_cols].dropna()
 
     print(f"\n  Properties with complete data: {len(X_data):,} ({len(X_data) / len(df) * 100:.1f}%)")
+    print(
+        f"  Education level range: {X_data['pct_bachelors_plus'].min():.1f}% - {X_data['pct_bachelors_plus'].max():.1f}% with bachelor's+")
 
     # Separate features
-    X_geo = X_data[['LATITUDE', 'LONGITUDE']].values
+    X_geo = X_data[['latitude', 'longitude']].values
     X_price = X_data[[Y_COL]].values
     X_sqft = X_data[[sqft_col]].values
+    X_education = X_data[['pct_bachelors_plus']].values
 
     # Standardize separately to control weighting
     scaler_geo = StandardScaler()
     scaler_price = StandardScaler()
     scaler_sqft = StandardScaler()
+    scaler_education = StandardScaler()
 
     X_geo_scaled = scaler_geo.fit_transform(X_geo)
     X_price_scaled = scaler_price.fit_transform(X_price)
     X_sqft_scaled = scaler_sqft.fit_transform(X_sqft)
+    X_education_scaled = scaler_education.fit_transform(X_education)
 
     # Apply weights
     X_geo_weighted = X_geo_scaled * location_weight
     X_price_weighted = X_price_scaled * price_weight
     X_sqft_weighted = X_sqft_scaled * sqft_weight
+    X_education_weighted = X_education_scaled * education_weight
 
     # Concatenate all features
-    X_combined = np.hstack([X_geo_weighted, X_price_weighted, X_sqft_weighted])
+    X_combined = np.hstack([X_geo_weighted, X_price_weighted, X_sqft_weighted, X_education_weighted])
 
     # Fit K-means
     print(f"\n  Fitting K-means with {n_clusters} clusters...")
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    df.loc[X_data.index, 'GEO_CLUSTER'] = kmeans.fit_predict(X_combined)
-    df['GEO_CLUSTER'] = df['GEO_CLUSTER'].fillna(df['GEO_CLUSTER'].mode()[0]).astype(int)
+    df.loc[X_data.index, 'geo_cluster'] = kmeans.fit_predict(X_combined)
+    df['geo_cluster'] = df['geo_cluster'].fillna(df['geo_cluster'].mode()[0]).astype(int)
 
     # Analyze clusters
-    cluster_stats = df.groupby('GEO_CLUSTER').agg({
+    cluster_stats = df.groupby('geo_cluster').agg({
         Y_COL: ['mean', 'std', 'min', 'max', 'count'],
         sqft_col: ['mean', 'std', 'min', 'max'],
-        'LATITUDE': ['mean', 'std'],
-        'LONGITUDE': ['mean', 'std']
+        'pct_bachelors_plus': ['mean', 'std', 'min', 'max'],
+        'latitude': ['mean', 'std'],
+        'longitude': ['mean', 'std']
     }).round(2)
 
     print(f"\n✓ Created {n_clusters} clusters")
@@ -591,23 +618,27 @@ def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS,
     print(f"  Price range: ${cluster_stats[(Y_COL, 'mean')].min():,.0f} - ${cluster_stats[(Y_COL, 'mean')].max():,.0f}")
     print(
         f"  Sqft range: {cluster_stats[(sqft_col, 'mean')].min():,.0f} - {cluster_stats[(sqft_col, 'mean')].max():,.0f} sqft")
+    print(
+        f"  Education range: {cluster_stats[('pct_bachelors_plus', 'mean')].min():.1f}% - {cluster_stats[('pct_bachelors_plus', 'mean')].max():.1f}% bachelor's+")
     print(f"  Avg within-cluster price std: ${cluster_stats[(Y_COL, 'std')].mean():,.0f}")
     print(f"  Avg within-cluster sqft std: {cluster_stats[(sqft_col, 'std')].mean():,.0f} sqft")
+    print(f"  Avg within-cluster education std: {cluster_stats[('pct_bachelors_plus', 'std')].mean():.1f}%")
     print(f"  Avg properties per cluster: {cluster_stats[(Y_COL, 'count')].mean():.0f}")
 
     # Show example clusters
     print(f"\nExample Clusters (Top 5 by size):")
     print(
-        f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Avg Sqft':>10} {'Price Std':>11} {'Sqft Std':>10} {'Lat':>8} {'Lon':>8}")
-    print("-" * 95)
+        f"{'Cluster':<10} {'N':>8} {'Avg Price':>12} {'Avg Sqft':>10} {'Edu%':>6} {'Price Std':>11} {'Lat':>8} {'Lon':>8}")
+    print("-" * 100)
 
     top_clusters = cluster_stats.nlargest(5, (Y_COL, 'count'))
     for idx in top_clusters.index:
         row = cluster_stats.loc[idx]
         print(f"Cluster {idx:<3} {int(row[(Y_COL, 'count')]):>8,} "
               f"${row[(Y_COL, 'mean')]:>11,.0f} {row[(sqft_col, 'mean')]:>9,.0f} "
-              f"${row[(Y_COL, 'std')]:>10,.0f} {row[(sqft_col, 'std')]:>9,.0f} "
-              f"{row[('LATITUDE', 'mean')]:>7.3f} {row[('LONGITUDE', 'mean')]:>7.3f}")
+              f"{row[('pct_bachelors_plus', 'mean')]:>5.1f}% "
+              f"${row[(Y_COL, 'std')]:>10,.0f} "
+              f"{row[('latitude', 'mean')]:>7.3f} {row[('longitude', 'mean')]:>7.3f}")
 
     return df
 
@@ -753,6 +784,7 @@ def validate_with_dowhy(data, treatment_col, treatment_info):
         print(f"\n❌ DoWhy validation failed: {e}")
         return None
 
+
 def save_dowhy_summary(all_results):
     """Save DoWhy validation results to file"""
     if not any(r.get('dowhy_validation') for r in all_results.values()):
@@ -787,6 +819,7 @@ def save_dowhy_summary(all_results):
 
     print("✓ Saved: dowhy_validation_summary.txt")
 
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -802,6 +835,32 @@ def main():
     # Load and prepare data
     print("\n[1/6] Loading and preparing data...")
     df = pd.read_parquet(DATA_PATH)
+
+    df.columns = df.columns.str.lower()
+
+    # Verify columns are lowercase
+    print(f"\n  Total columns: {len(df.columns)}")
+    print(f"  First 5 columns: {list(df.columns[:5])}")
+
+    # Check for required education columns
+    required_edu_cols = ['male_bachelors_degree', 'female_bachelors_degree', 'total_population_25plus']
+    available_edu_cols = [c for c in df.columns if 'bachelor' in c.lower() or 'population_25' in c.lower()]
+    print(f"  Education columns found: {available_edu_cols}")
+
+    missing_cols = [c for c in required_edu_cols if c not in df.columns]
+    if missing_cols:
+        print(f"\n❌ ERROR: Missing required columns: {missing_cols}")
+        print(f"   Columns are still uppercase. Converting now...")
+        # Force conversion again
+        df.columns = [c.lower() for c in df.columns]
+        print(f"   First 5 columns after conversion: {list(df.columns[:5])}")
+
+        # Check again
+        missing_cols = [c for c in required_edu_cols if c not in df.columns]
+        if missing_cols:
+            print(f"\n❌ FATAL: Still missing columns after conversion: {missing_cols}")
+            print(f"   Available columns: {list(df.columns)}")
+            return None
 
     if IS_PANEL_DATA:
         df = collapse_to_property_level(df, DECAY_FACTOR)
@@ -834,7 +893,7 @@ def main():
         # Analyze by cluster
         cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
 
-        # **NEW: DoWhy validation**
+        # DoWhy validation
         dowhy_results = None
         if RUN_DOWHY_VALIDATION:
             dowhy_results = validate_with_dowhy(data, treatment_col, treatment_info)
@@ -850,7 +909,7 @@ def main():
             'effects_dict': effects_dict,
             'cluster_effects': cluster_df,
             'treatment_info': treatment_info,
-            'dowhy_validation': dowhy_results  # **NEW: Store DoWhy results**
+            'dowhy_validation': dowhy_results
         }
 
     # Compare renovations
@@ -869,7 +928,7 @@ def main():
         results['cluster_effects'].to_csv(filename, index=False)
         print(f"✓ Saved: {filename}")
 
-    # **NEW: Save DoWhy validation summary**
+    # Save DoWhy validation summary
     print(f"\n[5/6] Saving validation summary...")
     save_dowhy_summary(all_results)
 
@@ -881,6 +940,7 @@ def main():
     print(f"{'=' * 80}")
 
     return all_results
+
 
 if __name__ == "__main__":
     if not ECONML_AVAILABLE:
