@@ -19,6 +19,7 @@ import seaborn as sns
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.multioutput import MultiOutputRegressor
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -114,7 +115,7 @@ CONFIDENCE_LEVEL = 0.95
 
 # Multi-treatment settings
 RUN_MULTI_TREATMENT_ANALYSIS = True
-DETAILED_CLUSTERS_TO_ANALYZE = 3  # How many clusters to show detailed analysis for
+DETAILED_CLUSTERS_TO_ANALYZE = 3
 
 
 # ============================================================================
@@ -535,6 +536,8 @@ def estimate_multi_treatment_effects(df, treatments_list):
     """
     Estimate effects of multiple treatments simultaneously
     Captures interaction effects between treatments
+
+    **FIX: Uses MultiOutputRegressor to handle multi-dimensional treatments**
     """
     if not ECONML_AVAILABLE:
         print("❌ EconML not available")
@@ -587,17 +590,16 @@ def estimate_multi_treatment_effects(df, treatments_list):
     for i, t in enumerate(treatments_list):
         print(f"  Treatment {i + 1} ({t}): mean={T[:, i].mean():.2f}, range=[{T[:, i].min():.0f}, {T[:, i].max():.0f}]")
 
-    # Fit multi-treatment model with Causal Forest
-    print("\n🔄 Fitting multi-treatment causal forest (this may take 3-5 minutes)...")
-    model = CausalForestDML(
+    # **FIX: Use LinearDML with MultiOutputRegressor for multi-dimensional treatments**
+    print("\n🔄 Fitting multi-treatment linear DML model (this may take 3-5 minutes)...")
+    print("   Using LinearDML (better for multi-dimensional treatments)")
+
+    # Wrap base learners in MultiOutputRegressor to handle multiple treatments
+    model = LinearDML(
         model_y=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
-        model_t=GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42),
-        n_estimators=100,
-        min_samples_leaf=50,
-        max_depth=8,
-        random_state=42,
-        verbose=0,
-        discrete_treatment=False
+        model_t=MultiOutputRegressor(GradientBoostingRegressor(n_estimators=100, max_depth=6, random_state=42)),
+        discrete_treatment=False,
+        random_state=42
     )
 
     if W is not None:
@@ -656,9 +658,16 @@ def predict_scenario(model, data_dict, cluster_id, treatment_values, property_si
             T_scenario[0, i] = treatment_values[treatment]
 
     # Predict marginal effect
-    marginal_effect = model.effect(X_baseline, T0=T_baseline, T1=T_scenario)[0, 0]
+    # For LinearDML with multi-dimensional treatment, effect() returns total effect
+    effect_result = model.effect(X_baseline, T0=T_baseline, T1=T_scenario)
 
-    return marginal_effect
+    # Handle different output shapes
+    if effect_result.ndim > 1:
+        marginal_effect = effect_result[0, 0] if effect_result.shape[1] > 0 else effect_result[0]
+    else:
+        marginal_effect = effect_result[0]
+
+    return float(marginal_effect)
 
 
 def analyze_scenarios_by_cluster(model, data_dict, scenarios, top_n_clusters=10):
@@ -1015,63 +1024,63 @@ def main():
 
     df = create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=PRICE_WEIGHT)
 
-    # ========================================================================
-    # PART A: INDIVIDUAL TREATMENT ANALYSIS
-    # ========================================================================
+    # # ========================================================================
+    # # PART A: INDIVIDUAL TREATMENT ANALYSIS
+    # # ========================================================================
     all_results = {}
-
-    print(f"\n[2/8] Analyzing {len(TREATMENTS)} renovation types individually...")
-
-    for treatment_col, treatment_info in TREATMENTS.items():
-        if treatment_col not in df.columns:
-            print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
-            continue
-
-        print(f"\n{'=' * 80}")
-        print(f"ANALYZING: {treatment_info['name']}")
-        print(f"{'=' * 80}")
-
-        data = prepare_econml_data(df, treatment_col)
-        model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
-
-        if model is None:
-            continue
-
-        cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
-
-        dowhy_results = None
-        if RUN_DOWHY_VALIDATION:
-            dowhy_results = validate_with_dowhy(data, treatment_col, treatment_info)
-
-        visualize_heterogeneous_effects(
-            {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
-            treatment_info
-        )
-
-        all_results[treatment_col] = {
-            'model': model,
-            'effects_dict': effects_dict,
-            'cluster_effects': cluster_df,
-            'treatment_info': treatment_info,
-            'dowhy_validation': dowhy_results
-        }
-
-    # Compare individual renovations
-    if len(all_results) > 1:
-        print(f"\n[3/8] Comparing individual renovation options...")
-        comparison_df = compare_renovation_options(all_results)
-        comparison_df.to_csv('renovation_comparison.csv', index=False)
-        print("\n✓ Saved: renovation_comparison.csv")
-
-    # Save individual results
-    print(f"\n[4/8] Saving individual treatment results...")
-    for treatment_col, results in all_results.items():
-        filename = f"cluster_effects_{treatment_col.lower()}.csv"
-        results['cluster_effects'].to_csv(filename, index=False)
-        print(f"✓ Saved: {filename}")
-
-    save_dowhy_summary(all_results)
-    create_summary_report(all_results)
+    #
+    # print(f"\n[2/8] Analyzing {len(TREATMENTS)} renovation types individually...")
+    #
+    # for treatment_col, treatment_info in TREATMENTS.items():
+    #     if treatment_col not in df.columns:
+    #         print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
+    #         continue
+    #
+    #     print(f"\n{'=' * 80}")
+    #     print(f"ANALYZING: {treatment_info['name']}")
+    #     print(f"{'=' * 80}")
+    #
+    #     data = prepare_econml_data(df, treatment_col)
+    #     model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
+    #
+    #     if model is None:
+    #         continue
+    #
+    #     cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
+    #
+    #     dowhy_results = None
+    #     if RUN_DOWHY_VALIDATION:
+    #         dowhy_results = validate_with_dowhy(data, treatment_col, treatment_info)
+    #
+    #     visualize_heterogeneous_effects(
+    #         {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
+    #         treatment_info
+    #     )
+    #
+    #     all_results[treatment_col] = {
+    #         'model': model,
+    #         'effects_dict': effects_dict,
+    #         'cluster_effects': cluster_df,
+    #         'treatment_info': treatment_info,
+    #         'dowhy_validation': dowhy_results
+    #     }
+    #
+    # # Compare individual renovations
+    # if len(all_results) > 1:
+    #     print(f"\n[3/8] Comparing individual renovation options...")
+    #     comparison_df = compare_renovation_options(all_results)
+    #     comparison_df.to_csv('renovation_comparison.csv', index=False)
+    #     print("\n✓ Saved: renovation_comparison.csv")
+    #
+    # # Save individual results
+    # print(f"\n[4/8] Saving individual treatment results...")
+    # for treatment_col, results in all_results.items():
+    #     filename = f"cluster_effects_{treatment_col.lower()}.csv"
+    #     results['cluster_effects'].to_csv(filename, index=False)
+    #     print(f"✓ Saved: {filename}")
+    #
+    # save_dowhy_summary(all_results)
+    # create_summary_report(all_results)
 
     # ========================================================================
     # PART B: MULTI-TREATMENT SCENARIO ANALYSIS
@@ -1388,20 +1397,12 @@ if __name__ == "__main__":
 
         if results.get('multi_treatment_model') is not None:
             # Example 1: Specific renovation for a cluster
-            print(f"\n📋 Example 1: What if I add 1 half bath + 2 bedrooms in Cluster 44?")
-            run_custom_scenario(results, cluster_id=44,
+            print(f"\n📋 Example 1: What if I add 1 half bath + 2 bedrooms in top cluster?")
+            top_cluster = results['multi_treatment_data']['df']['geo_cluster'].value_counts().index[0]
+            run_custom_scenario(results, cluster_id=top_cluster,
                                 custom_renovations={
                                     'half_baths_coal': 1,
                                     'bedrooms_mls': 2
-                                })
-
-            # Example 2: Different cluster
-            print(f"\n📋 Example 2: Major renovation in Cluster 21")
-            run_custom_scenario(results, cluster_id=21,
-                                custom_renovations={
-                                    'bedrooms_mls': 3,
-                                    'full_baths_coal': 2,
-                                    'garage_spaces_coal': 1
                                 })
 
             print(f"\n💡 TIP: Use run_custom_scenario() to test any renovation combination!")
