@@ -20,6 +20,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 from sklearn.multioutput import MultiOutputRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score, mean_squared_error
+from sklearn.inspection import permutation_importance
+from sklearn.svm import SVR
+from econml.dml import CausalForestDML, LinearDML
+
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -48,8 +54,6 @@ RUN_DOWHY_VALIDATION = True
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
-DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df_with_census_edu.parquet"
 
 IS_PANEL_DATA = True
 PROPERTYID_COL = "propertyid"
@@ -218,56 +222,85 @@ def prepare_econml_data(df, treatment_col):
     }
 
 
-def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS,
-                        price_weight=0.25,
-                        sqft_weight=0.15,
-                        education_weight=0.15,
-                        sqft_col='livingareasqft_coal'):
-    """Create geographic clusters"""
-    location_weight = 1.0 - price_weight - sqft_weight - education_weight
+def create_geo_clusters_with_politics_income(df, n_clusters=12,
+                                             price_weight=0.18,
+                                             sqft_weight=0.12,
+                                             education_weight=0.12,
+                                             politics_weight=0.14,
+                                             income_weight=0.12,
+                                             sqft_col='livingareasqft_coal',
+                                             income_col='median_earnings_total',
+                                             Y_COL='saleamt'):
+    """Create geographic clusters including political affiliation and median income"""
+
+    location_weight = 1.0 - price_weight - sqft_weight - education_weight - politics_weight - income_weight
 
     if location_weight < 0:
-        raise ValueError(f"Weights sum to more than 1.0!")
+        raise ValueError(
+            f"Weights sum to more than 1.0! Current sum: {price_weight + sqft_weight + education_weight + politics_weight + income_weight:.2f}")
 
     print(f"\n{'=' * 80}")
-    print(f"CREATING {n_clusters} GEO-PRICE-SQFT-EDUCATION CLUSTERS")
+    print(f"CREATING {n_clusters} GEO-PRICE-SQFT-EDUCATION-POLITICS-INCOME CLUSTERS")
     print(f"{'=' * 80}")
-    print(f"  Location weight: {location_weight:.1%}")
-    print(f"  Price weight: {price_weight:.1%}")
-    print(f"  Sqft weight: {sqft_weight:.1%}")
+    print(f"  Location weight:  {location_weight:.1%}")
+    print(f"  Price weight:     {price_weight:.1%}")
+    print(f"  Sqft weight:      {sqft_weight:.1%}")
     print(f"  Education weight: {education_weight:.1%}")
+    print(f"  Politics weight:  {politics_weight:.1%}")
+    print(f"  Income weight:    {income_weight:.1%}")
+    print(
+        f"  Total:            {location_weight + price_weight + sqft_weight + education_weight + politics_weight + income_weight:.1%}")
 
+    # Calculate education percentage
     df['pct_bachelors_plus'] = (
                                        (df['male_bachelors_degree'] + df['female_bachelors_degree']) /
                                        df['total_population_25plus']
                                ).fillna(0) * 100
 
-    required_cols = ['latitude', 'longitude', Y_COL, sqft_col, 'pct_bachelors_plus']
+    # Define required columns
+    required_cols = ['latitude', 'longitude', Y_COL, sqft_col,
+                     'pct_bachelors_plus', 'dem_lift', income_col]
+
     X_data = df[required_cols].dropna()
 
     print(f"\n  Properties with complete data: {len(X_data):,} ({len(X_data) / len(df) * 100:.1f}%)")
 
+    # Prepare features
     X_geo = X_data[['latitude', 'longitude']].values
     X_price = X_data[[Y_COL]].values
     X_sqft = X_data[[sqft_col]].values
     X_education = X_data[['pct_bachelors_plus']].values
+    X_politics = X_data[['dem_lift']].values
+    X_income = X_data[[income_col]].values
 
+    # Scale all features
     scaler_geo = StandardScaler()
     scaler_price = StandardScaler()
     scaler_sqft = StandardScaler()
     scaler_education = StandardScaler()
+    scaler_politics = StandardScaler()
+    scaler_income = StandardScaler()
 
     X_geo_scaled = scaler_geo.fit_transform(X_geo)
     X_price_scaled = scaler_price.fit_transform(X_price)
     X_sqft_scaled = scaler_sqft.fit_transform(X_sqft)
     X_education_scaled = scaler_education.fit_transform(X_education)
+    X_politics_scaled = scaler_politics.fit_transform(X_politics)
+    X_income_scaled = scaler_income.fit_transform(X_income)
 
+    # Apply weights
     X_geo_weighted = X_geo_scaled * location_weight
     X_price_weighted = X_price_scaled * price_weight
     X_sqft_weighted = X_sqft_scaled * sqft_weight
     X_education_weighted = X_education_scaled * education_weight
+    X_politics_weighted = X_politics_scaled * politics_weight
+    X_income_weighted = X_income_scaled * income_weight
 
-    X_combined = np.hstack([X_geo_weighted, X_price_weighted, X_sqft_weighted, X_education_weighted])
+    # Combine features
+    X_combined = np.hstack([
+        X_geo_weighted, X_price_weighted, X_sqft_weighted,
+        X_education_weighted, X_politics_weighted, X_income_weighted
+    ])
 
     print(f"\n  Fitting K-means with {n_clusters} clusters...")
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
@@ -275,6 +308,35 @@ def create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS,
     df['geo_cluster'] = df['geo_cluster'].fillna(df['geo_cluster'].mode()[0]).astype(int)
 
     print(f"\n✓ Created {n_clusters} clusters")
+
+    # Print cluster statistics
+    print(f"\n  Cluster demographics summary:")
+    print(f"  {'Cluster':<8} {'N':>8} {'Price':>12} {'Bach%':>6} {'Dem+':>6} {'Income':>10}")
+    print("  " + "-" * 60)
+
+    for cluster_id in sorted(df['geo_cluster'].unique()):
+        cluster_data = df[df['geo_cluster'] == cluster_id]
+        n = len(cluster_data)
+        avg_price = cluster_data[Y_COL].mean()
+        avg_edu = cluster_data['pct_bachelors_plus'].mean()
+        avg_dem = cluster_data['dem_lift'].mean()
+        avg_income = cluster_data[income_col].mean()
+
+        print(f"  {cluster_id:<8} {n:>8,} ${avg_price:>10,.0f} "
+              f"{avg_edu:>5.1f}% {avg_dem:>5.1f}% ${avg_income:>9,.0f}")
+
+    # Print income range by cluster
+    print(f"\n  Income range by cluster:")
+    print(f"  {'Cluster':<8} {'Min Income':>12} {'Median':>12} {'Max Income':>12}")
+    print("  " + "-" * 50)
+
+    for cluster_id in sorted(df['geo_cluster'].unique()):
+        cluster_data = df[df['geo_cluster'] == cluster_id]
+        min_income = cluster_data[income_col].min()
+        med_income = cluster_data[income_col].median()
+        max_income = cluster_data[income_col].max()
+
+        print(f"  {cluster_id:<8} ${min_income:>11,.0f} ${med_income:>11,.0f} ${max_income:>11,.0f}")
 
     return df
 
@@ -412,7 +474,7 @@ def analyze_effects_by_cluster(effects_dict, data, treatment_info):
     print(
         f"  This {treatment_info['unit']} is worth ${effect_range:,.0f} more in Cluster {int(best_cluster['cluster'])} vs Cluster {int(worst_cluster['cluster'])}")
 
-    return cluster_df
+    return cluster_df, cluster_data
 
 
 def compare_renovation_options(all_results):
@@ -727,6 +789,125 @@ def analyze_scenarios_by_cluster(model, data_dict, scenarios, top_n_clusters=10)
     return results_df
 
 
+def create_geo_clusters_with_politics_income(df, n_clusters=12,
+                                             price_weight=0.18,
+                                             sqft_weight=0.12,
+                                             education_weight=0.12,
+                                             politics_weight=0.14,
+                                             income_weight=0.12,
+                                             sqft_col='livingareasqft_coal',
+                                             income_col='median_earnings_total',
+                                             Y_COL='saleamt'):
+    """Create geographic clusters including political affiliation and median income"""
+
+    location_weight = 1.0 - price_weight - sqft_weight - education_weight - politics_weight - income_weight
+
+    if location_weight < 0:
+        raise ValueError(
+            f"Weights sum to more than 1.0! Current sum: {price_weight + sqft_weight + education_weight + politics_weight + income_weight:.2f}")
+
+    print(f"\n{'=' * 80}")
+    print(f"CREATING {n_clusters} GEO-PRICE-SQFT-EDUCATION-POLITICS-INCOME CLUSTERS")
+    print(f"{'=' * 80}")
+    print(f"  Location weight:  {location_weight:.1%}")
+    print(f"  Price weight:     {price_weight:.1%}")
+    print(f"  Sqft weight:      {sqft_weight:.1%}")
+    print(f"  Education weight: {education_weight:.1%}")
+    print(f"  Politics weight:  {politics_weight:.1%}")
+    print(f"  Income weight:    {income_weight:.1%}")
+    print(
+        f"  Total:            {location_weight + price_weight + sqft_weight + education_weight + politics_weight + income_weight:.1%}")
+
+    # Calculate education percentage
+    df['pct_bachelors_plus'] = (
+                                       (df['male_bachelors_degree'] + df['female_bachelors_degree']) /
+                                       df['total_population_25plus']
+                               ).fillna(0) * 100
+
+    # Define required columns
+    required_cols = ['latitude', 'longitude', Y_COL, sqft_col,
+                     'pct_bachelors_plus', 'dem_lift', income_col]
+
+    X_data = df[required_cols].dropna()
+
+    print(f"\n  Properties with complete data: {len(X_data):,} ({len(X_data) / len(df) * 100:.1f}%)")
+
+    # Prepare features
+    X_geo = X_data[['latitude', 'longitude']].values
+    X_price = X_data[[Y_COL]].values
+    X_sqft = X_data[[sqft_col]].values
+    X_education = X_data[['pct_bachelors_plus']].values
+    X_politics = X_data[['dem_lift']].values
+    X_income = X_data[[income_col]].values
+
+    # Scale all features
+    scaler_geo = StandardScaler()
+    scaler_price = StandardScaler()
+    scaler_sqft = StandardScaler()
+    scaler_education = StandardScaler()
+    scaler_politics = StandardScaler()
+    scaler_income = StandardScaler()
+
+    X_geo_scaled = scaler_geo.fit_transform(X_geo)
+    X_price_scaled = scaler_price.fit_transform(X_price)
+    X_sqft_scaled = scaler_sqft.fit_transform(X_sqft)
+    X_education_scaled = scaler_education.fit_transform(X_education)
+    X_politics_scaled = scaler_politics.fit_transform(X_politics)
+    X_income_scaled = scaler_income.fit_transform(X_income)
+
+    # Apply weights
+    X_geo_weighted = X_geo_scaled * location_weight
+    X_price_weighted = X_price_scaled * price_weight
+    X_sqft_weighted = X_sqft_scaled * sqft_weight
+    X_education_weighted = X_education_scaled * education_weight
+    X_politics_weighted = X_politics_scaled * politics_weight
+    X_income_weighted = X_income_scaled * income_weight
+
+    # Combine features
+    X_combined = np.hstack([
+        X_geo_weighted, X_price_weighted, X_sqft_weighted,
+        X_education_weighted, X_politics_weighted, X_income_weighted
+    ])
+
+    print(f"\n  Fitting K-means with {n_clusters} clusters...")
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    df.loc[X_data.index, 'geo_cluster'] = kmeans.fit_predict(X_combined)
+    df['geo_cluster'] = df['geo_cluster'].fillna(df['geo_cluster'].mode()[0]).astype(int)
+
+    print(f"\n✓ Created {n_clusters} clusters")
+
+    # Print cluster statistics
+    print(f"\n  Cluster demographics summary:")
+    print(f"  {'Cluster':<8} {'N':>8} {'Price':>12} {'Bach%':>6} {'Dem+':>6} {'Income':>10}")
+    print("  " + "-" * 60)
+
+    for cluster_id in sorted(df['geo_cluster'].unique()):
+        cluster_data = df[df['geo_cluster'] == cluster_id]
+        n = len(cluster_data)
+        avg_price = cluster_data[Y_COL].mean()
+        avg_edu = cluster_data['pct_bachelors_plus'].mean()
+        avg_dem = cluster_data['dem_lift'].mean()
+        avg_income = cluster_data[income_col].mean()
+
+        print(f"  {cluster_id:<8} {n:>8,} ${avg_price:>10,.0f} "
+              f"{avg_edu:>5.1f}% {avg_dem:>5.1f}% ${avg_income:>9,.0f}")
+
+    # Print income range by cluster
+    print(f"\n  Income range by cluster:")
+    print(f"  {'Cluster':<8} {'Min Income':>12} {'Median':>12} {'Max Income':>12}")
+    print("  " + "-" * 50)
+
+    for cluster_id in sorted(df['geo_cluster'].unique()):
+        cluster_data = df[df['geo_cluster'] == cluster_id]
+        min_income = cluster_data[income_col].min()
+        med_income = cluster_data[income_col].median()
+        max_income = cluster_data[income_col].max()
+
+        print(f"  {cluster_id:<8} ${min_income:>11,.0f} ${med_income:>11,.0f} ${max_income:>11,.0f}")
+
+    return df
+
+
 def compare_scenarios_single_cluster(model, data_dict, cluster_id, scenarios):
     """
     Compare multiple scenarios for a single cluster with detailed output
@@ -1002,6 +1183,229 @@ def create_summary_report(all_results):
     print("✓ Saved: causal_analysis_summary.txt")
 
 
+def build_price_model(df):
+    """
+    Build model to predict current property price (saleamt)
+    """
+    print(f"\n=== BUILDING PRICE PREDICTION MODEL ===")
+
+    # Features for price prediction
+    price_features = [
+        'livingareasqft_coal',
+        'lotsizesqft_coal',
+        'yearbuilt_coal',
+        'effectiveyearbuilt_coal',
+        'fireplace_count_mls',
+        'half_baths_coal',
+        'full_baths_coal',
+        'bedrooms_mls',
+        'garage_spaces_coal',
+        'total_population_25plus',
+        'male_bachelors_degree',
+        'female_bachelors_degree',
+        'pct_bachelors_plus',
+        'pct_white',
+        'dem_lift',
+        'geo_cluster'
+    ]
+
+    # Get available features
+    available_features = [f for f in price_features if f in df.columns]
+
+    # Clean data
+    df_price = df[available_features + [Y_COL]].dropna()
+
+    # Remove outliers
+    q01, q99 = df_price[Y_COL].quantile([0.01, 0.99])
+    df_price = df_price[(df_price[Y_COL] >= q01) & (df_price[Y_COL] <= q99)]
+
+    print(f"Sample size: {len(df_price):,}")
+    print(f"Features: {len(available_features)}")
+
+    X = df_price[available_features].values
+    y = df_price[Y_COL].values
+
+    # Train model
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    model = GradientBoostingRegressor(
+        n_estimators=200,
+        max_depth=8,
+        learning_rate=0.05,
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+
+    # Evaluate
+    y_pred_train = model.predict(X_train)
+    y_pred_test = model.predict(X_test)
+
+    train_mae = mean_absolute_error(y_train, y_pred_train)
+    test_mae = mean_absolute_error(y_test, y_pred_test)
+    train_r2 = r2_score(y_train, y_pred_train)
+    test_r2 = r2_score(y_test, y_pred_test)
+
+    print(f"\nModel Performance:")
+    print(f"  Train MAE: ${train_mae:,.0f} | R²: {train_r2:.3f}")
+    print(f"  Test MAE:  ${test_mae:,.0f} | R²: {test_r2:.3f}")
+
+    # Feature importance
+    importance_df = pd.DataFrame({
+        'feature': available_features,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
+
+    print(f"\nTop 10 Features:")
+    for _, row in importance_df.head(10).iterrows():
+        print(f"  {row['feature']:<30} {row['importance']:.3f}")
+
+    # Save model predictions
+    df_price['predicted_price'] = model.predict(X)
+    df_price['price_error'] = df_price[Y_COL] - df_price['predicted_price']
+    df_price['price_error_pct'] = (df_price['price_error'] / df_price[Y_COL]) * 100
+
+    output_cols = available_features + [Y_COL, 'predicted_price', 'price_error', 'price_error_pct']
+    df_price[output_cols].to_csv('price_predictions.csv', index=False)
+    print(f"\n✓ Saved: price_predictions.csv")
+
+    return model, importance_df
+
+
+def build_price_model_svr(df):
+    """
+    Build SVR model to predict current property price (saleamt)
+    """
+    print(f"\n=== BUILDING PRICE PREDICTION MODEL (SVR) ===")
+
+    # Features for price prediction
+    price_features = [
+        'livingareasqft_coal',
+        'lotsizesqft_coal',
+        'yearbuilt_coal',
+        'effectiveyearbuilt_coal',
+        'fireplace_count_mls',
+        'half_baths_coal',
+        'full_baths_coal',
+        'bedrooms_mls',
+        'garage_spaces_coal',
+        'total_population_25plus',
+        'male_bachelors_degree',
+        'female_bachelors_degree',
+        'pct_bachelors_plus',
+        'pct_white',
+        'dem_lift',
+        'geo_cluster'
+    ]
+
+    # Get available features
+    available_features = [f for f in price_features if f in df.columns]
+
+    # Clean data
+    df_price = df[available_features + [Y_COL]].dropna()
+
+    # Remove outliers
+    q01, q99 = df_price[Y_COL].quantile([0.01, 0.99])
+    df_price = df_price[(df_price[Y_COL] >= q01) & (df_price[Y_COL] <= q99)]
+
+    print(f"Sample size: {len(df_price):,}")
+    print(f"Features: {len(available_features)}")
+
+    X = df_price[available_features].values
+    y = df_price[Y_COL].values
+
+    # Train-test split
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42
+    )
+
+    # CRITICAL: Scale features for SVR
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    X_test_scaled = scaler_X.transform(X_test)
+    X_scaled = scaler_X.transform(X)
+
+    # Scale y for better SVR performance
+    y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).ravel()
+
+    print("\n→ Scaling features (required for SVR)...")
+
+    # Train SVR model
+    print("→ Training SVR model...")
+    model = SVR(
+        kernel='rbf',  # Radial basis function kernel
+        C=100,  # Regularization parameter
+        epsilon=0.1,  # Epsilon in epsilon-SVR model
+        gamma='scale',  # Kernel coefficient
+        cache_size=1000,  # Cache size in MB
+        verbose=False
+    )
+    model.fit(X_train_scaled, y_train_scaled)
+
+    # Make predictions (need to inverse transform)
+    y_pred_train_scaled = model.predict(X_train_scaled)
+    y_pred_test_scaled = model.predict(X_test_scaled)
+
+    y_pred_train = scaler_y.inverse_transform(y_pred_train_scaled.reshape(-1, 1)).ravel()
+    y_pred_test = scaler_y.inverse_transform(y_pred_test_scaled.reshape(-1, 1)).ravel()
+
+    # Evaluate
+    train_mae = mean_absolute_error(y_train, y_pred_train)
+    test_mae = mean_absolute_error(y_test, y_pred_test)
+    train_r2 = r2_score(y_train, y_pred_train)
+    test_r2 = r2_score(y_test, y_pred_test)
+    train_rmse = np.sqrt(mean_squared_error(y_train, y_pred_train))
+    test_rmse = np.sqrt(mean_squared_error(y_test, y_pred_test))
+
+    print(f"\nModel Performance:")
+    print(f"  Train MAE:  ${train_mae:,.0f} | R²: {train_r2:.3f} | RMSE: ${train_rmse:,.0f}")
+    print(f"  Test MAE:   ${test_mae:,.0f} | R²: {test_r2:.3f} | RMSE: ${test_rmse:,.0f}")
+
+    # Feature importance (using permutation importance since SVR doesn't have feature_importances_)
+    print("\n→ Calculating feature importance (this may take a moment)...")
+    perm_importance = permutation_importance(
+        model, X_test_scaled,
+        scaler_y.transform(y_test.reshape(-1, 1)).ravel(),
+        n_repeats=10,
+        random_state=42,
+        n_jobs=-1
+    )
+
+    importance_df = pd.DataFrame({
+        'feature': available_features,
+        'importance': perm_importance.importances_mean,
+        'std': perm_importance.importances_std
+    }).sort_values('importance', ascending=False)
+
+    print(f"\nTop 10 Features (Permutation Importance):")
+    for _, row in importance_df.head(10).iterrows():
+        print(f"  {row['feature']:<30} {row['importance']:.3f} ± {row['std']:.3f}")
+
+    # Save model predictions on full dataset
+    y_pred_scaled = model.predict(X_scaled)
+    y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).ravel()
+
+    df_price['predicted_price'] = y_pred
+    df_price['price_error'] = df_price[Y_COL] - df_price['predicted_price']
+    df_price['price_error_pct'] = (df_price['price_error'] / df_price[Y_COL]) * 100
+
+    output_cols = available_features + [Y_COL, 'predicted_price', 'price_error', 'price_error_pct']
+    df_price[output_cols].to_csv('price_predictions_svr.csv', index=False)
+    print(f"\n✓ Saved: price_predictions_svr.csv")
+
+    # Return model and scalers (both needed for predictions)
+    return {
+        'model': model,
+        'scaler_X': scaler_X,
+        'scaler_y': scaler_y,
+        'importance_df': importance_df,
+        'features': available_features
+    }
+
+
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
@@ -1014,73 +1418,92 @@ def main():
     print(" " * 5 + "ECONML MULTI-TREATMENT CAUSAL ANALYSIS: RENOVATION EFFECTS")
     print("=" * 80)
 
+    DATA_PATH = "/Users/jenny.lin/BASIS_AVM_Onboarding/cate_scenario_analyses/data/inference_df_with_politics.parquet"
     # Load and prepare data
     print("\n[1/8] Loading and preparing data...")
     df = pd.read_parquet(DATA_PATH)
     df.columns = df.columns.str.lower()
+    print(df.columns)
 
-    if IS_PANEL_DATA:
-        df = collapse_to_property_level(df, DECAY_FACTOR)
+    build_price_model_svr(df)
 
-    df = create_geo_clusters(df, n_clusters=N_GEO_CLUSTERS, price_weight=PRICE_WEIGHT)
+    df = create_geo_clusters_with_politics_income(df, n_clusters=12,
+                                     price_weight=0.18,
+                                     sqft_weight=0.12,
+                                     education_weight=0.12,
+                                     race_weight=0.10,
+                                     politics_weight=0.15,
+                                     sqft_col='livingareasqft_coal',
+                                     Y_COL='saleamt')
 
-    # # ========================================================================
-    # # PART A: INDIVIDUAL TREATMENT ANALYSIS
-    # # ========================================================================
+    # ADD THIS: Save property-to-cluster mapping
+    print("\n[BONUS] Saving property-to-cluster mapping...")
+    mapping_cols = ['propertyid', 'geo_cluster', 'latitude', 'longitude',
+                    'saleamt', 'livingareasqft_coal']
+    mapping_df = df[mapping_cols].copy()
+    mapping_df.to_csv('property_cluster_mapping.csv', index=False)
+    print(f"✓ Saved: property_cluster_mapping.csv ({len(mapping_df):,} properties)")
+
+    # ========================================================================
+    # PART A: INDIVIDUAL TREATMENT ANALYSIS
+    # ========================================================================
     all_results = {}
-    #
-    # print(f"\n[2/8] Analyzing {len(TREATMENTS)} renovation types individually...")
-    #
-    # for treatment_col, treatment_info in TREATMENTS.items():
-    #     if treatment_col not in df.columns:
-    #         print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
-    #         continue
-    #
-    #     print(f"\n{'=' * 80}")
-    #     print(f"ANALYZING: {treatment_info['name']}")
-    #     print(f"{'=' * 80}")
-    #
-    #     data = prepare_econml_data(df, treatment_col)
-    #     model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
-    #
-    #     if model is None:
-    #         continue
-    #
-    #     cluster_df = analyze_effects_by_cluster(effects_dict, data, treatment_info)
-    #
-    #     dowhy_results = None
-    #     if RUN_DOWHY_VALIDATION:
-    #         dowhy_results = validate_with_dowhy(data, treatment_col, treatment_info)
-    #
-    #     visualize_heterogeneous_effects(
-    #         {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
-    #         treatment_info
-    #     )
-    #
-    #     all_results[treatment_col] = {
-    #         'model': model,
-    #         'effects_dict': effects_dict,
-    #         'cluster_effects': cluster_df,
-    #         'treatment_info': treatment_info,
-    #         'dowhy_validation': dowhy_results
-    #     }
-    #
-    # # Compare individual renovations
-    # if len(all_results) > 1:
-    #     print(f"\n[3/8] Comparing individual renovation options...")
-    #     comparison_df = compare_renovation_options(all_results)
-    #     comparison_df.to_csv('renovation_comparison.csv', index=False)
-    #     print("\n✓ Saved: renovation_comparison.csv")
-    #
-    # # Save individual results
-    # print(f"\n[4/8] Saving individual treatment results...")
-    # for treatment_col, results in all_results.items():
-    #     filename = f"cluster_effects_{treatment_col.lower()}.csv"
-    #     results['cluster_effects'].to_csv(filename, index=False)
-    #     print(f"✓ Saved: {filename}")
-    #
-    # save_dowhy_summary(all_results)
-    # create_summary_report(all_results)
+
+    print(f"\n[2/8] Analyzing {len(TREATMENTS)} renovation types individually...")
+
+    for treatment_col, treatment_info in TREATMENTS.items():
+        if treatment_col not in df.columns:
+            print(f"\n⚠️ Skipping {treatment_info['name']} - column not in data")
+            continue
+
+        print(f"\n{'=' * 80}")
+        print(f"ANALYZING: {treatment_info['name']}")
+        print(f"{'=' * 80}")
+
+        data = prepare_econml_data(df, treatment_col)
+        model, effects_dict = estimate_heterogeneous_effects(data, ECONML_METHOD)
+
+        if model is None:
+            continue
+
+        cluster_df, cluster_data = analyze_effects_by_cluster(effects_dict, data, treatment_info)
+
+        cluster_data.to_csv('all_results_cluster_data.csv')
+
+        dowhy_results = None
+        if RUN_DOWHY_VALIDATION:
+            dowhy_results = validate_with_dowhy(data, treatment_col, treatment_info)
+
+        visualize_heterogeneous_effects(
+            {'cluster_effects': cluster_df, 'effects_dict': effects_dict},
+            treatment_info
+        )
+
+        all_results[treatment_col] = {
+            'model': model,
+            'effects_dict': effects_dict,
+            'cluster_effects': cluster_df,
+            'cluster_data': cluster_data,
+            'treatment_info': treatment_info,
+            'dowhy_validation': dowhy_results
+        }
+
+    # Compare individual renovations
+    if len(all_results) > 1:
+        print(f"\n[3/8] Comparing individual renovation options...")
+        comparison_df = compare_renovation_options(all_results)
+        comparison_df.to_csv('renovation_comparison.csv', index=False)
+        print("\n✓ Saved: renovation_comparison.csv")
+
+    # Save individual results
+    print(f"\n[4/8] Saving individual treatment results...")
+    for treatment_col, results in all_results.items():
+        filename = f"cluster_effects_{treatment_col.lower()}.csv"
+        results['cluster_effects'].to_csv(filename, index=False)
+        print(f"✓ Saved: {filename}")
+
+    save_dowhy_summary(all_results)
+    create_summary_report(all_results)
 
     # ========================================================================
     # PART B: MULTI-TREATMENT SCENARIO ANALYSIS
@@ -1108,6 +1531,8 @@ def main():
 
     if model_multi is None:
         return {'individual_results': all_results}
+
+    print('Cluster Data Printed')
 
     # ========================================================================
     # DEFINE COMPREHENSIVE SCENARIOS
@@ -1243,9 +1668,9 @@ def main():
 
     print(f"✓ Defined {len(scenarios)} renovation scenarios")
 
-    # ========================================================================
-    # ANALYZE SCENARIOS ACROSS ALL CLUSTERS
-    # ========================================================================
+#     # ========================================================================
+#     # ANALYZE SCENARIOS ACROSS ALL CLUSTERS
+#     # ========================================================================
 
     print(f"\n[7/8] Analyzing scenarios across clusters...")
     results_all = analyze_scenarios_by_cluster(
@@ -1254,9 +1679,9 @@ def main():
     results_all.to_csv('scenario_analysis_all_clusters.csv', index=False)
     print("✓ Saved: scenario_analysis_all_clusters.csv")
 
-    # ========================================================================
-    # DETAILED ANALYSIS FOR TOP CLUSTERS
-    # ========================================================================
+#     # ========================================================================
+#     # DETAILED ANALYSIS FOR TOP CLUSTERS
+#     # ========================================================================
 
     print(f"\n[8/8] Detailed analysis for top {DETAILED_CLUSTERS_TO_ANALYZE} clusters...")
     top_clusters = df_multi['geo_cluster'].value_counts().head(DETAILED_CLUSTERS_TO_ANALYZE).index
@@ -1273,9 +1698,9 @@ def main():
             print(f"✓ Saved: {filename}")
             detailed_results[cluster_id] = results_cluster
 
-    # ========================================================================
-    # VISUALIZATIONS AND SUMMARY
-    # ========================================================================
+#     # ========================================================================
+#     # VISUALIZATIONS AND SUMMARY
+#     # ========================================================================
 
     print(f"\n📊 Creating visualizations...")
     visualize_scenario_comparison(results_all)
@@ -1308,11 +1733,11 @@ def main():
         'detailed_results': detailed_results
     }
 
-
-# ============================================================================
-# CUSTOM SCENARIO RUNNER (OPTIONAL)
-# ============================================================================
-
+#
+# # ============================================================================
+# # CUSTOM SCENARIO RUNNER (OPTIONAL)
+# # ============================================================================
+#
 def run_custom_scenario(results, cluster_id, custom_renovations):
     """
     Run a custom scenario not in the predefined list
